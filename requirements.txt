@@ -1,4 +1,6 @@
-streamlit>=1.50
+# Streamlit Cloud: set Python to 3.12 in Advanced settings.
+# ortools has no linux wheel for 3.13 yet, and 3.14 is not offered.
+streamlit>=1.64
 pandas>=2.2
 pydfs-lineup-optimizer==3.6.1
-ortools>=9.10
+ortools>=9.11,<10
