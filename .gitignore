@@ -1,0 +1,16 @@
+# data — salary files and projections are per-slate, keep them out
+*.csv
+*.xlsx
+*.xlsm
+
+# python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+
+# os / editor
+.DS_Store
+.vscode/
+.idea/
