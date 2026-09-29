@@ -25,6 +25,36 @@ When projections are supplied they replace `AvgPointsPerGame` as the optimizatio
 target, and players are dropped if they have no projection, are listed `O`, or
 project at or below 0.6.
 
+## Showdown
+
+Pick **DraftKings Showdown** as the site and upload a single-game salary file
+(the one with `Roster Position` = CPT/FLEX). A few things differ from the main
+slate, handled automatically:
+
+- The captain-mode importer replaces each player's position with CPT/FLEX, so the
+  real position (QB/RB/WR/TE/K/DST) is read back from the salary file.
+- The pool holds every player twice, once per slot. The table lists each once,
+  and excludes and exposure apply to both copies.
+- Projections reapply the captain's 1.5x multiplier, otherwise a CPT would look
+  worthless at 1.5x the salary.
+- The opposing-team, same-team and stacking rules are hidden — it is one game, so
+  every player already faces every other.
+
+Defaults differ too, because a showdown pool is roughly 24 usable players against
+300 on a main slate:
+
+| | Main slate | Showdown |
+|---|---|---|
+| Number of lineups | 100 | 20 |
+| Min unique players | 0 | 2 |
+| Global max exposure | 50% | 50% |
+
+Measured on a 24-player pool: min-unique 2 buys real diversity for ~0.3 projected
+points where 3 costs 2.0 for none, 20 lineups is where the pool stops yielding new
+rosters, and a 50% cap reduces overlap for free while 35% costs ~3 points. The one
+thing settings cannot fix is captain concentration — expect 5-7 distinct captains
+across 20 lineups.
+
 ## What it does
 
 - **Player pool** — filter by position and team, lock/exclude/set exposure in bulk or per player

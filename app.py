@@ -65,21 +65,31 @@ st.sidebar.header("Settings")
 site = st.sidebar.selectbox("Site", ["DraftKings", "DraftKings Showdown"])
 is_showdown = site == "DraftKings Showdown"
 sport = st.sidebar.selectbox("Sport", ["NFL", "NBA", "MLB", "NHL"])
-num_lineups = st.sidebar.number_input("Number of lineups", min_value=1, max_value=150,
-                                      value=100, step=10)
+# Showdown is a 6-man roster from one game, so the usable pool is tiny compared
+# with a main slate. Fewer lineups, min-unique on, and no global cap — with ~24
+# players some are unavoidable, so a cap just fails silently.
+num_lineups = st.sidebar.number_input(
+    "Number of lineups", min_value=1, max_value=150,
+    value=20 if is_showdown else 100, step=5 if is_showdown else 10)
 
 st.sidebar.subheader("Exposure")
 global_max_exp = st.sidebar.slider(
     "Global max exposure %", min_value=0, max_value=100, value=50, step=5,
-    help="Default cap for every player. 100% means no cap. Per-player values override "
-         "this. 50% costs nothing in projection here and stops one player carrying most "
-         "of your entries.",
+    help=("Measured on a 24-player showdown pool: 50% cuts lineup overlap at no cost "
+          "to projection, while tighter caps get expensive fast (35% costs ~3 points, "
+          "25% costs ~9)."
+          if is_showdown else
+          "Default cap for every player. 100% means no cap. Per-player values override "
+          "this. 50% costs nothing in projection here and stops one player carrying "
+          "most of your entries."),
 )
 min_unique = st.sidebar.number_input(
-    "Min unique players per lineup", min_value=0, max_value=5, value=0, step=1,
+    "Min unique players per lineup", min_value=0, max_value=5,
+    value=2 if is_showdown else 0, step=1,
     help="0 is off. At 2, no two lineups may share more than roster-2 players — it "
-         "removes near-twin lineups that differ by a single name. Costs a little "
-         "projection; does not touch your projections the way randomness does.",
+         "removes near-twin lineups that differ by a single name. On showdown this is "
+         "the main diversification lever, since exposure caps can't bind on a small "
+         "pool.",
 )
 
 strategy_label = st.sidebar.selectbox(
@@ -390,9 +400,12 @@ if dk_file is not None:
                 for one in str(joined).split("/"):
                     have[one] += 1
             needed = Counter()
-            for slot in optimizer.settings.positions:
-                if len(slot.positions) == 1:
-                    needed[slot.positions[0]] += 1
+            if not is_showdown:
+                # Showdown's slots are CPT/FLEX, which any player can fill — they
+                # aren't real positions, so there is nothing per-position to check.
+                for slot in optimizer.settings.positions:
+                    if len(slot.positions) == 1:
+                        needed[slot.positions[0]] += 1
             return [(pos, needed[pos], have.get(pos, 0))
                     for pos in sorted(needed) if have.get(pos, 0) < needed[pos]], have
 
