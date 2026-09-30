@@ -4,6 +4,7 @@ import tempfile
 import os
 import re
 import io
+import time
 from collections import Counter, defaultdict
 from pydfs_lineup_optimizer import (get_optimizer, Site, Sport, LineupOptimizerException,
                                     TotalExposureStrategy, AfterEachExposureStrategy,
@@ -158,6 +159,42 @@ def order_positions(positions, sport):
         return (len(preferred), position)
 
     return sorted(positions, key=key)
+
+
+class CombinedExposureRule(OptimizerRule):
+    """Cap a player's exposure across every pool entry they occupy.
+
+    Showdown holds each player twice (CPT and FLEX) as separate Player objects,
+    so the library's own max_exposure caps each copy independently — a 50% cap
+    lets a player reach 100% of lineups. This counts the real player once per
+    lineup and blocks every copy once the cap is reached.
+    """
+
+    def __init__(self, optimizer, players_dict, context):
+        super().__init__(optimizer, players_dict, context)
+        self.caps = getattr(optimizer, "combined_exposure", None) or {}
+        self.total = context.total_lineups or 1
+        self.used = Counter()
+        self.var_key = {}
+        self.key_vars = defaultdict(list)
+        for player, variable in players_dict.items():
+            key = player.full_name
+            self.var_key[variable.name] = key
+            self.key_vars[key].append(variable)
+
+    def apply_for_iteration(self, solver, result):
+        for key, cap in self.caps.items():
+            if not cap:
+                continue
+            if self.used[key] / self.total >= cap:
+                variables = self.key_vars.get(key)
+                if variables:
+                    solver.add_constraint(variables, None, SolverSign.EQ, 0)
+
+    def post_optimize(self, solved_variables):
+        keys = {self.var_key[name] for name in solved_variables if name in self.var_key}
+        for key in keys:
+            self.used[key] += 1
 
 
 class TeamCapUnlessQBRule(OptimizerRule):
@@ -644,10 +681,79 @@ if dk_file is not None:
             same_team_pairs = []
             cap_no_qb = cap_with_qb = roster_slots
             qb_stack_specs, flex_rows, mix_rows = [], [], []
-            mix_mode = False
-            batch_plan = [{"specs": [], "flex": None, "weight": 1.0,
-                           "label": "showdown", "count": num_lineups}]
-            batch_counts = [num_lineups]
+
+            st.markdown("**Captain mix**")
+            st.caption(
+                "Share of lineups captained by each position. The captain is worth 1.5x, "
+                "so it is the biggest single decision on a showdown slate. Leave the table "
+                "empty to let projections choose — which tends to settle on a handful of "
+                "captains. Across 163 studied winning showdown slates the top-1% captains "
+                "were roughly WR 33%, RB 28%, QB 21%."
+            )
+            cpt_positions = sorted(
+                {r["Position"] for _, r in merged_df.iterrows() if r["Position"] != "?"},
+                key=lambda x: available_positions.index(x)
+                if x in available_positions else 99)
+            st.session_state.setdefault("cpt_rows", [])
+            st.session_state.setdefault("cpt_nonce", 0)
+            cpt_df = pd.DataFrame(
+                [{"Position": r["position"], "Share %": r["share"]}
+                 for r in st.session_state.cpt_rows],
+                columns=["Position", "Share %"])
+            cpt_df["Share %"] = cpt_df["Share %"].astype("Float64")
+            edited_cpt = st.data_editor(
+                cpt_df, num_rows="dynamic", width="content", hide_index=True,
+                column_config={
+                    "Position": st.column_config.SelectboxColumn(
+                        "Position", options=cpt_positions, required=True),
+                    "Share %": st.column_config.NumberColumn(
+                        "Share %", min_value=1, max_value=100, step=5, required=True),
+                },
+                key=f"cpt_editor_{st.session_state.cpt_nonce}",
+            )
+            collected_cpt = []
+            for _, row in edited_cpt.iterrows():
+                if pd.isna(row["Position"]) or pd.isna(row["Share %"]):
+                    continue
+                if row["Position"] in {r["position"] for r in collected_cpt}:
+                    continue
+                collected_cpt.append({"position": str(row["Position"]),
+                                      "share": float(row["Share %"])})
+            if collected_cpt != st.session_state.cpt_rows:
+                st.session_state.cpt_rows = collected_cpt
+                st.session_state.cpt_nonce += 1
+                st.rerun()
+            cpt_rows = st.session_state.cpt_rows
+
+            if cpt_rows:
+                ctot = sum(r["share"] for r in cpt_rows)
+                if abs(ctot - 100) > 0.5:
+                    st.warning(f"Captain shares add up to {ctot:.0f}%, not 100% — "
+                               "they'll be scaled proportionally.")
+                raw = [r["share"] / ctot * num_lineups for r in cpt_rows]
+                counts = [int(x) for x in raw]
+                for i in sorted(range(len(raw)), key=lambda j: raw[j] - counts[j],
+                                reverse=True)[:num_lineups - sum(counts)]:
+                    counts[i] += 1
+                batch_plan = [{"specs": [], "flex": None, "captain": r["position"],
+                               "weight": r["share"] / ctot,
+                               "label": f"{r['position']} captain", "count": c}
+                              for r, c in zip(cpt_rows, counts)]
+                for b in batch_plan:
+                    st.caption(f"→ {b['label']}: {b['weight']:.0%} → {b['count']} lineup"
+                               f"{'s' if b['count'] != 1 else ''}")
+                if any(b["count"] < 1 for b in batch_plan):
+                    st.warning(
+                        f"**Number of lineups is {num_lineups}**, too few to split across "
+                        f"{len(batch_plan)} captain positions — some get 0."
+                    )
+                batch_counts = [b["count"] for b in batch_plan]
+                mix_mode = True
+            else:
+                mix_mode = False
+                batch_plan = [{"specs": [], "flex": None, "captain": None, "weight": 1.0,
+                               "label": "showdown", "count": num_lineups}]
+                batch_counts = [num_lineups]
         else:
             st.subheader("3. Opposing Team Position Restriction")
             has_game_info = bool(optimizer.player_pool.games)
@@ -1002,12 +1108,25 @@ if dk_file is not None:
 
                 # Exposure is a property of the Player, so set it before locking —
                 # lock_player rejects anyone capped at 0.
-                for nm, pct in max_exp.items():
-                    for pl in by_name.get(nm, ()):
-                        pl.max_exposure = pct / 100
-                for nm, pct in min_exp.items():
-                    for pl in by_name.get(nm, ()):
-                        pl.min_exposure = pct / 100
+                if is_showdown:
+                    # One cap per real player, not per slot copy.
+                    combined = {}
+                    for nm in by_name:
+                        pct = max_exp.get(nm, global_max_exp if global_max_exp < 100 else None)
+                        if pct:
+                            combined[nm] = pct / 100
+                    opt.combined_exposure = combined
+                    opt.add_new_rule(CombinedExposureRule)
+                    for nm, pct in min_exp.items():
+                        for pl in by_name.get(nm, ()):
+                            pl.min_exposure = pct / 100
+                else:
+                    for nm, pct in max_exp.items():
+                        for pl in by_name.get(nm, ()):
+                            pl.max_exposure = pct / 100
+                    for nm, pct in min_exp.items():
+                        for pl in by_name.get(nm, ()):
+                            pl.min_exposure = pct / 100
 
                 for nm in excluded_names:
                     for pl in by_name.get(nm, ()):
@@ -1079,8 +1198,15 @@ if dk_file is not None:
                         st.warning(f"QB stack skipped: {exc}")
 
 
-            def make_optimizer(specs, solver, report, flex=None):
+            def make_optimizer(specs, solver, report, flex=None, captain=None):
                 opt = configure_optimizer(report=report, solver=solver)
+                if captain:
+                    # Every player sits in the pool twice. Dropping the CPT copy
+                    # of anyone at another position leaves only this position
+                    # able to fill the captain slot.
+                    for pl in list(opt.player_pool.all_players):
+                        if "CPT" in pl.positions and real_by_id.get(str(pl.id)) != captain:
+                            opt.player_pool.remove_player(pl)
                 if flex:
                     # An extra required player at a position pushes one into the
                     # flex slot: the roster needs 3 WRs, so asking for 4 puts a
@@ -1090,7 +1216,7 @@ if dk_file is not None:
                     add_qb_stack(opt, spec, report=report)
                 return opt
 
-            def run_batch(specs, count, report=True, exclude=(), flex=None):
+            def run_batch(specs, count, report=True, exclude=(), flex=None, captain=None):
                 """Solve on the fast engine, fall back to the library default.
 
                 The fallback exists for the error message: PuLP names the
@@ -1099,20 +1225,30 @@ if dk_file is not None:
                 each batch is its own optimizer run, so without it the same
                 roster can come back twice.
                 """
-                kwargs = dict(optimize_kwargs)
-                if exclude:
-                    kwargs["exclude_lineups"] = list(exclude)
+                def attempt(solver, report_):
+                    opt = make_optimizer(specs, solver, report_, flex, captain)
+                    kwargs = dict(optimize_kwargs)
+                    if exclude:
+                        # Batches can have different pools — forcing a captain
+                        # position drops the other CPT copies. The library looks
+                        # excluded lineups up in its player map without guarding,
+                        # so anything it can no longer see has to be dropped here.
+                        have = {pl.id for pl in opt.player_pool.filtered_players}
+                        keep = [lu for lu in exclude
+                                if all(pl.id in have for pl in lu.players)]
+                        if keep:
+                            kwargs["exclude_lineups"] = keep
+                    return list(opt.optimize(count, **kwargs))
+
                 if FAST_SOLVER is not None:
                     try:
-                        return list(make_optimizer(specs, FAST_SOLVER, report, flex)
-                                    .optimize(count, **kwargs))
+                        return attempt(FAST_SOLVER, report)
                     except LineupOptimizerException:
                         pass
-                return list(make_optimizer(specs, None, report, flex)
-                            .optimize(count, **kwargs))
+                return attempt(None, report)
 
             optimize_kwargs = {"exposure_strategy": strategy_map[strategy_label]}
-            if global_max_exp < 100:
+            if global_max_exp < 100 and not is_showdown:
                 optimize_kwargs["max_exposure"] = global_max_exp / 100
 
             all_lineups = []
@@ -1160,17 +1296,23 @@ if dk_file is not None:
                 "knock-on effects rather than the rule you actually set."
             )
 
+            run_started = time.time()
+            progress = st.status(f"Building {num_lineups} lineups…", expanded=True)
+
             if mix_mode:
                 # One optimizer run per (stack shape x flex position) combination.
                 # This batching is the app's, not the library's.
                 for idx, b in enumerate(batch_plan):
+                    progress.write(f"{idx + 1} of {len(batch_plan)} — {b['label']} "
+                                   f"({b['count']} lineup{'s' if b['count'] != 1 else ''})")
                     if b["count"] < 1:
                         mix_report.append({"Rule": b["label"], "Share %":
                                            round(b["weight"] * 100, 1), "Lineups": 0})
                         continue
                     try:
                         batch = run_batch(b["specs"], b["count"], report=(idx == 0),
-                                          exclude=lineups, flex=b["flex"])
+                                          exclude=lineups, flex=b["flex"],
+                                          captain=b.get("captain"))
                     except LineupOptimizerException as exc:
                         st.error(f"**\"{b['label']}\" failed:** {exc}\n\n" + trouble)
                         show_diagnostics()
@@ -1179,6 +1321,7 @@ if dk_file is not None:
                     mix_report.append({"Rule": b["label"], "Share %":
                                        round(b["weight"] * 100, 1), "Lineups": len(batch)})
             else:
+                progress.write(f"solving {num_lineups} lineups…")
                 try:
                     lineups = run_batch(qb_stack_specs, num_lineups)
                 except LineupOptimizerException as exc:
@@ -1202,6 +1345,10 @@ if dk_file is not None:
                     "Team": "", "Salary": lineup.salary_costs,
                     "AvgPoints": round(lineup.fantasy_points_projection, 2)
                 })
+
+            elapsed = time.time() - run_started
+            progress.update(label=f"Built {len(lineups)} lineups in {elapsed:.1f}s",
+                            state="complete", expanded=False)
 
             # Stash the results: rendering happens outside the button block so a
             # filter click doesn't make the whole section disappear.
@@ -1273,6 +1420,8 @@ if dk_file is not None:
                 mix_df["Actual %"] = (mix_df["Lineups"] / max(len(lineups), 1) * 100).round(1)
 
             st.session_state.results = {
+                "built_at": time.strftime("%H:%M:%S"),
+                "took": elapsed,
                 "lineups": result_df,
                 "exposure": exposure_df,
                 "mix": mix_df,
@@ -1284,6 +1433,10 @@ if dk_file is not None:
         results = st.session_state.get("results")
         if results is not None:
             st.subheader("Generated Lineups")
+            if results.get("built_at"):
+                st.caption(f"Built at **{results['built_at']}** in "
+                           f"{results['took']:.1f}s. Generating again gives a different set "
+                           "whenever randomness is on.")
             st.dataframe(results["lineups"], width="stretch")
 
             if results["mix"] is not None:
