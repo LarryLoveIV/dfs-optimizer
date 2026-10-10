@@ -2,5 +2,7 @@
 # ortools has no linux wheel for 3.13 yet, and 3.14 is not offered.
 streamlit>=1.64
 pandas>=2.2
+numpy>=1.26
 pydfs-lineup-optimizer==3.6.1
 ortools>=9.11,<10
+draft_kings==3.1.0

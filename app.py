@@ -1,4 +1,5 @@
 import streamlit as st
+import numpy as np
 import pandas as pd
 import tempfile
 import os
@@ -6,6 +7,7 @@ import re
 import io
 import time
 from collections import Counter, defaultdict
+from itertools import combinations
 from pydfs_lineup_optimizer import (get_optimizer, Site, Sport, LineupOptimizerException,
                                     TotalExposureStrategy, AfterEachExposureStrategy,
                                     PlayersGroup, Stack, RandomFantasyPointsStrategy)
@@ -15,6 +17,15 @@ from pydfs_lineup_optimizer.stacks import NestedPlayersGroup
 from pydfs_lineup_optimizer.rules import OptimizerRule
 from pydfs_lineup_optimizer.solvers import SolverSign
 
+import sim
+
+try:
+    # Reads DraftKings' public lobby endpoints, no login. Optional: without the
+    # package the app only offers the CSV upload.
+    import dk_lobby
+except Exception:
+    dk_lobby = None
+
 try:
     # Same model, faster engine. Verified to produce identical lineups; if the
     # import fails the app just falls back to the library's default solver.
@@ -22,41 +33,94 @@ try:
 except Exception:
     FAST_SOLVER = None
 
-# Jitter applied to each projection, keyed off the contest's actual field size.
-#
-# Boundaries come from how the field-size numbers are actually used in practice
-# rather than from any standard definition (there isn't one):
-#   - Establish The Run's game-selection work treats ~1.1k-6k as the small-field
-#     zone it prefers (a 1,136-entry $50 Red Zone and a 1,960-entry $15 are cited
-#     as small-field; 2,450 is preferred over 9,803 and 19,607; 5,882 is called
-#     "about as small as possible" for a GPP at that buy-in).
-#   - DK's Flea Flicker, described as mid-tier, runs ~8k-24k entries.
-#   - The Milly Maker is 150k+; a recent Football Millionaire drew 832k.
-#
-# One Week Season frames the same split by variance rather than headcount: in
-# small fields and cash you manage variance and build tight rosters; in large
-# top-heavy fields you accept variance to win outright. The ladder below follows
-# that shape.
-#
-# The percentages themselves come from optimizer guidance (Footballguys,
-# Stokastic) putting the usable band at 2-5% with 5% a ceiling. Neither ETR nor
-# OWS prescribes an optimizer randomness number. Measured on a 100-lineup run
-# with this pool: 2-5% costs ~0.1 projection points while cutting top-player
-# exposure from 85% to 70%; 12% costs a full point and 25% costs 3.4.
-FIELD_RANDOMNESS = [
-    (500,          0.01, "very small — manage variance, build the tightest roster"),
-    (6_000,        0.02, "small field — ETR's preferred zone"),
-    (50_000,       0.03, "mid field — Flea Flicker territory"),
-    (150_000,      0.04, "large field — accept variance to win outright"),
-    (float("inf"), 0.05, "Milly Maker scale"),
+# Contest tiers by entry count — the user's own definitions. Each tier sets two
+# things:
+#   - Randomness: jitter applied to each projection before every solve. The
+#     percentages come from optimizer guidance (Footballguys, Stokastic) putting
+#     the usable band at 2-5% with 5% a ceiling; neither ETR nor OWS prescribes
+#     a number. Measured on a 100-lineup run with this pool: 2-5% costs ~0.1
+#     projection points while cutting top-player exposure from 85% to 70%; 12%
+#     costs a full point and 25% costs 3.4. Smaller fields reward tight rosters,
+#     bigger ones accepting variance to win outright (One Week Season's framing).
+#   - Ownership: TwoGunGPT files carry a small-field and a large-field (Milly
+#     Maker) column; the tiers between step from one to the other.
+# (upper entry limit, name, randomness, share of small-field ownership)
+CONTEST_TIERS = [
+    (3_000,        "Small",  0.02, 1.0),
+    (5_000,        "Medium", 0.03, 0.67),
+    (14_000,       "Large",  0.04, 0.33),
+    (float("inf"), "Milly",  0.05, 0.0),
 ]
 
 
+def contest_tier(entries):
+    """(name, randomness, small-field ownership share) for a contest size."""
+    for limit, name, dev, small in CONTEST_TIERS:
+        if entries is not None and entries <= limit:
+            return name, dev, small
+    return CONTEST_TIERS[-1][1:]
+
+
 def randomness_for_field(entries):
-    for limit, dev, note in FIELD_RANDOMNESS:
-        if entries <= limit:
-            return dev, note
-    return 0.05, ""
+    name, dev, _ = contest_tier(entries)
+    lower = {"Small": "up to 3,000", "Medium": "3,001-5,000", "Large": "5,001-14,000",
+             "Milly": "over 14,000"}[name]
+    return dev, f"{name} tier ({lower} entries)"
+
+
+# Simulated opponents per run. Enough to place the field's top 1% each sim;
+# more costs memory (field x sims scores) without moving the threshold much.
+FIELD_LINEUPS = 3000
+
+
+def ownership_label(entries):
+    name, _, small = contest_tier(entries)
+    if small >= 1:
+        return f"small-field ownership, {name} tier"
+    if small <= 0:
+        return f"Milly (large-field) ownership, {name} tier"
+    return f"{small:.0%} small-field / {1 - small:.0%} Milly ownership, {name} tier"
+
+
+def blend_ownership(frame, entries):
+    """The tier's mix of TwoGunGPT's small-field and Milly ownership columns."""
+    large = pd.to_numeric(frame.get("Ownership"), errors="coerce")
+    small = frame.get("Small Field Ownership")
+    if small is None:
+        return large
+    small = pd.to_numeric(small, errors="coerce").fillna(large)
+    w = contest_tier(entries)[2]
+    return w * small + (1 - w) * large.fillna(small)
+
+
+def sim_pool(frame, pool_players):
+    """The table the simulator works on: one row per player, with his real
+    position (Pos), opponent (Opp) and the projection used as the simulated
+    mean (Proj) — the true projection even when the optimizer chases Ceiling
+    or Nuke."""
+    opp_of = {}
+    for p in pool_players:
+        gi = p.game_info
+        if gi and gi.home_team and gi.away_team:
+            opp_of[p.full_name] = gi.away_team if p.team == gi.home_team else gi.home_team
+    pool = frame.copy()
+    pool["Pos"] = pool["Position"].astype(str).str.split("/").str[0]
+    pool["Opp"] = pool["Name"].map(opp_of)
+    mean_col = next(c for c in ("Projection", "ppg_projection", "AvgPoints")
+                    if c in pool.columns)
+    pool["Proj"] = pd.to_numeric(pool[mean_col], errors="coerce").fillna(0)
+    return pool.dropna(subset=["Opp"]).reset_index(drop=True)
+
+
+@st.cache_data(ttl=300, show_spinner="Reading the DraftKings lobby…")
+def lobby_slates():
+    return dk_lobby.slates()
+
+
+@st.cache_data(ttl=300, show_spinner="Loading players from DraftKings…")
+def lobby_salaries(draft_group_id, kind):
+    """(salary-export CSV text, time fetched) for one slate."""
+    return dk_lobby.salaries_csv(draft_group_id, kind), time.strftime("%-I:%M %p")
 
 
 st.set_page_config(page_title="DFS Lineup Optimizer", layout="wide")
@@ -128,6 +192,53 @@ else:
         "redrawn per lineup. Displayed projections stay the real ones."
     )
 
+if contest_mode != "Tournament (GPP)":
+    field_entries = None
+sim_on = False
+if sport == "NFL" and contest_mode != "Cash / single entry":
+    st.sidebar.subheader("Simulation")
+    sim_on = st.sidebar.toggle(
+        "Pick lineups by simulation",
+        help="Builds extra lineups, simulates the slate thousands of times with "
+             "teammates' and opponents' scores correlated the way they are in real games, "
+             "then keeps the set of lineups that most often finishes near the top. Stack, "
+             "flex and QB + RB shares are kept.")
+    if sim_on and field_entries is None:
+        field_entries = st.sidebar.number_input(
+            "Field size (entries)", min_value=2, max_value=2_000_000, value=5_000,
+            step=500, key="sim_field_entries",
+            help="Picks large- or small-field ownership and sets how many duplicates "
+                 "to expect.")
+    if sim_on:
+        sim_mult = st.sidebar.select_slider(
+            "Lineups to build and compare",
+            options=[2, 3, 5, 8, 10, 20, 30], value=20 if is_showdown else 30,
+            format_func=lambda m: f"{m * num_lineups:,}",
+            help="The optimizer builds this many lineups under all your rules, the sim "
+                 "plays the slate out thousands of times, and only your best "
+                 f"{num_lineups} are kept. A bigger pile gives the sim more to choose "
+                 "from, at the cost of a slower build. Tested on Week 5: on the main "
+                 "slate (20 and 40 lineups) 30 per lineup beat 5 on every build and "
+                 "measure, about 90 seconds for 40; on a 16-lineup showdown 20 per "
+                 "lineup with 50,000 sims was best and bigger piles slipped.")
+        st.sidebar.caption(
+            f"Build **{sim_mult * num_lineups:,}** → keep the best **{num_lineups}** "
+            f"(1 in {sim_mult}).")
+        sim_runs = st.sidebar.select_slider(
+            "Simulations", options=[1000, 2500, 5000, 10000, 50000],
+            value=50000 if is_showdown else 5000,
+            help="More sims separate genuine upside from lucky draws, which matters "
+                 "more the bigger the pile. On a showdown 50,000 adds only seconds; on a "
+                 "main slate it needs a lot of memory, so start at 5,000 there.")
+        sim_top = st.sidebar.select_slider(
+            "Target finish", options=[0.1, 0.5, 1.0, 2.0, 5.0], value=0.5,
+            format_func=lambda v: f"top {v:g}%",
+            help="Tested for money (Week 3 and 5 main, Super Booster and standard GPP "
+                 "payouts, 8 builds each): top 0.5% beat 1% in every contest and scenario. "
+                 "A lineup scores a hit in a sim when it lands in this top slice of all "
+                 "the lineups built. They're all optimized, so this is a much higher bar "
+                 "than the same slice of a real contest field.") / 100
+
 site_map = {"DraftKings": Site.DRAFTKINGS,
             "DraftKings Showdown": Site.DRAFTKINGS_CAPTAIN_MODE}
 sport_map = {"NFL": Sport.FOOTBALL, "NBA": Sport.BASKETBALL, "MLB": Sport.BASEBALL, "NHL": Sport.HOCKEY}
@@ -135,9 +246,65 @@ sport_map = {"NFL": Sport.FOOTBALL, "NBA": Sport.BASKETBALL, "MLB": Sport.BASEBA
 st.subheader("1. Upload Files")
 col1, col2 = st.columns(2)
 with col1:
-    dk_file = st.file_uploader("DK/FD Salaries CSV", type="csv", key="dk")
+    dk_content = None
+    sources = (["DraftKings lobby", "Upload CSV"] if sport == "NFL" and dk_lobby
+               else ["Upload CSV"])
+    salary_source = st.segmented_control("Salaries", sources, default=sources[0],
+                                         required=True, key="salary_source")
+    if salary_source == "Upload CSV":
+        dk_file = st.file_uploader("DK/FD Salaries CSV", type="csv", key="dk")
+        st.link_button("Get DraftKings salaries", "https://www.draftkings.com/lobby#/NFL",
+                       icon=":material/open_in_new:",
+                       help="Opens the NFL lobby. Open a contest for the slate you want and "
+                            "use Export to CSV (Export Players List), then drop the file in "
+                            "the box above.")
+        if dk_file is not None:
+            dk_content = dk_file.getvalue().decode("utf-8-sig")
+    else:
+        kind = "showdown" if is_showdown else "classic"
+        lobby_error, open_slates = None, []
+        try:
+            open_slates = [x for x in lobby_slates() if x["kind"] == kind]
+        except Exception as exc:
+            lobby_error = exc
+        if lobby_error:
+            st.warning(f"Couldn't reach the DraftKings lobby ({lobby_error}). Switch to "
+                       "**Upload CSV** and use the exported salary file instead.")
+        elif not open_slates:
+            st.info(f"No open {kind} slates in the DraftKings lobby right now.")
+        else:
+            # Labels are the options; a repeat (same tag, time and contest
+            # count) gets its draft group id so each stays distinct.
+            seen = Counter(x["label"] for x in open_slates)
+            by_label = {(x["label"] if seen[x["label"]] == 1
+                         else f"{x['label']} · #{x['id']}"): x for x in open_slates}
+            labels = list(by_label)
+            main = next((i for i, lab in enumerate(labels) if lab.startswith("Main")), 0)
+            pick = by_label[st.selectbox("Slate", labels, index=main,
+                                         key=f"dk_slate_{kind}")]
+            try:
+                dk_content, fetched_at = lobby_salaries(pick["id"], kind)
+            except Exception as exc:
+                st.warning(f"Couldn't load that slate's players ({exc}). Try again, or "
+                           "switch to **Upload CSV**.")
+            with st.container(horizontal=True, vertical_alignment="center"):
+                if dk_content:
+                    n = dk_content.count("\n") - 1
+                    st.caption(f"{n} players from DraftKings, fetched {fetched_at}.")
+                if st.button("Refresh", icon=":material/refresh:", key="dk_refresh",
+                             help="Salaries rarely move, but players get scratched — "
+                                  "refresh near lock to drop anyone already ruled out."):
+                    lobby_slates.clear()
+                    lobby_salaries.clear()
+                    st.rerun()
 with col2:
     cheatsheet_file = st.file_uploader("Projections Cheatsheet CSV", type="csv", key="cheat")
+    # The download itself needs a signed-in browser (TwoGunGPT's terms bar
+    # scripted access), so the app links to the board rather than fetching it.
+    st.link_button("Get TwoGunGPT projections", "https://twogungpt.com/projections/",
+                   icon=":material/open_in_new:",
+                   help="Opens the Ceiling Board. Sign in, pick the slate and press "
+                        "DOWNLOAD, then drop the CSV in the box above.")
 
 
 # Conventional roster order per sport, so pills read the way a lineup does
@@ -197,6 +364,92 @@ class CombinedExposureRule(OptimizerRule):
             self.used[key] += 1
 
 
+class PlayerComboRule(OptimizerRule):
+    """Min/max share of lineups in which a set of players all appear together.
+
+    The library only knows per-player exposure, so a combo needs its own rule.
+    Each combo arrives as absolute lineup counts for this run (the caller
+    converts percentages, so mixed batches can share one overall target).
+
+    Max: once the combo has been used max_count times, the players' variables
+    may sum to at most k-1, i.e. never all of them again.
+    Min: forcing is paced across the run rather than bunched at the start or
+    end, and skipped for any lineup where one of the players is at their own
+    max exposure — forcing then would make the lineup infeasible. Under "after
+    each lineup" a capped player is blocked every other lineup, so the pacing
+    catches up on the next open one. If a player is capped for good, the combo
+    falls short rather than failing the run; the results table shows the gap.
+    """
+
+    def __init__(self, optimizer, players_dict, context):
+        super().__init__(optimizer, players_dict, context)
+        self.combos = getattr(optimizer, "player_combos", None) or []
+        self.total = context.total_lineups or 1
+        self.used = [0] * len(self.combos)
+        self.var_key = {}
+        self.key_vars = defaultdict(list)
+        caps = {}
+        for player, variable in players_dict.items():
+            self.var_key[variable.name] = player.full_name
+            self.key_vars[player.full_name].append(variable)
+            cap = (player.max_exposure if player.max_exposure is not None
+                   else context.max_exposure)
+            if cap is not None:
+                caps[player.full_name] = cap
+        # Mirror the library's own cap bookkeeping so we know who is blocked.
+        # Showdown caps live in CombinedExposureRule, which counts on totals.
+        combined = getattr(optimizer, "combined_exposure", None)
+        if combined:
+            caps.update(combined)
+            strategy = TotalExposureStrategy
+        else:
+            strategy = context.exposure_strategy
+        self.caps = strategy(caps, self.total)
+
+    def apply_for_iteration(self, solver, result):
+        built = self.total - self.context.remaining_lineups
+        for i, combo in enumerate(self.combos):
+            names = combo["players"]
+            if any(not self.key_vars.get(nm) for nm in names):
+                continue          # someone isn't in the pool; can't apply
+            max_count, min_count = combo.get("max_count"), combo.get("min_count")
+            if max_count is not None and self.used[i] >= max_count:
+                variables = [v for nm in names for v in self.key_vars[nm]]
+                solver.add_constraint(variables, None, SolverSign.LTE, len(names) - 1)
+            elif (min_count and not any(self.caps.is_reached_exposure(nm) for nm in names)
+                  and (self.used[i] < -(-min_count * (built + 1) // self.total)
+                       or self.slots_left(names) <= min_count - self.used[i])):
+                # Showdown copies: at least one of each player's CPT/FLEX vars.
+                for nm in names:
+                    solver.add_constraint(self.key_vars[nm], None, SolverSign.GTE, 1)
+
+    def slots_left(self, names):
+        """Lineups the most-capped player can still join under a total cap.
+
+        A player who keeps getting picked on his own can burn through his cap
+        before the paced combo is done; once his slots are down to what the
+        combo still owes, the combo has to take them.
+        """
+        if not isinstance(self.caps, TotalExposureStrategy):
+            return float("inf")
+        left = float("inf")
+        for nm in names:
+            cap = self.caps.exposures.get(nm)
+            if cap:
+                # The epsilon absorbs float error: a batch cap of a/c times c
+                # can land a hair above a and ceil to a+1.
+                left = min(left, -(-(cap * self.total - 1e-9) // 1)
+                           - self.caps.used_vars.get(nm, 0))
+        return left
+
+    def post_optimize(self, solved_variables):
+        picked = {self.var_key[name] for name in solved_variables if name in self.var_key}
+        self.caps.set_used(list(picked))
+        for i, combo in enumerate(self.combos):
+            if set(combo["players"]) <= picked:
+                self.used[i] += 1
+
+
 class TeamCapUnlessQBRule(OptimizerRule):
     """Cap players per team, with a higher cap for the team whose QB is rostered.
 
@@ -232,14 +485,24 @@ class TeamCapUnlessQBRule(OptimizerRule):
                 solver.add_constraint(non_qb, None, SolverSign.LTE, cap)
 
 
-def build_qb_stack(pool, qb_side, bring_back, max_exposure=None):
+STACK_CATCHERS = ("WR", "TE")
+
+
+def build_qb_stack(pool, qb_side, bring_back, max_exposure=None, partner="pass"):
     """A single Stack requiring: a QB, (qb_side-1) of his teammates, and
     `bring_back` players from his opponent.
+
+    Teammates and bring-backs count only if they catch passes (WR/TE): a QB's
+    points move with his receivers' (r ~0.35) but not his RB's (~0.05) or his
+    DST's, so a QB + RB "stack" pays the cost of stacking for none of the
+    correlation. partner="rb" is the deliberate exception — one of the
+    teammates must be an RB, the rest are still WR/TE.
 
     One stack rather than two means the QB can anchor the same-team part and the
     game part at once — separate stacks may not share a player, and with one QB
     slot that makes a QB-anchored stack plus a game stack impossible.
     """
+    catches = lambda p: any(pos in STACK_CATCHERS for pos in p.positions)
     # filtered_players, not all_players: removed players are absent from the
     # solver's player map, and the library's exposure branch looks group members
     # up without guarding, so including them raises KeyError once a cap is set.
@@ -251,17 +514,36 @@ def build_qb_stack(pool, qb_side, bring_back, max_exposure=None):
         for own, opp in ((game.home_team, game.away_team),
                          (game.away_team, game.home_team)):
             qbs = [p for p in by_team[own] if "QB" in p.positions]
-            mates = [p for p in by_team[own] if "QB" not in p.positions]
-            others = by_team[opp]
-            if not qbs or len(mates) < qb_side - 1 or len(others) < bring_back:
+            mates = [p for p in by_team[own] if "QB" not in p.positions and catches(p)]
+            rbs = [p for p in by_team[own] if "RB" in p.positions]
+            others = [p for p in by_team[opp] if catches(p)]
+            need_rb = partner == "rb" and qb_side > 1
+            need_mates = qb_side - 1 - need_rb
+            if (not qbs or len(mates) < need_mates or len(others) < bring_back
+                    or (need_rb and not rbs)):
                 continue
             members = [PlayersGroup(qbs, min_from_group=1)]
-            if qb_side > 1:
-                members.append(PlayersGroup(mates, min_from_group=qb_side - 1))
+            if need_rb:
+                members.append(PlayersGroup(rbs, min_from_group=1))
+            if need_mates:
+                members.append(PlayersGroup(mates, min_from_group=need_mates))
             if bring_back:
                 members.append(PlayersGroup(others, min_from_group=bring_back))
             groups.append(NestedPlayersGroup(groups=members, max_exposure=max_exposure))
     return Stack(groups=groups) if groups else None
+
+
+def count_combos(lineups_df, size):
+    """How many lineups contain each group of `size` players.
+
+    Every subset of every lineup is counted, so a 9-man roster yields 36 pairs,
+    84 trios and 126 foursomes per lineup — a few thousand at 150 lineups.
+    """
+    picks = lineups_df[lineups_df["Position"] != "TOTAL"]
+    counts = Counter()
+    for _, names in picks.groupby("Lineup")["Name"]:
+        counts.update(combinations(sorted(set(names)), size))
+    return counts
 
 
 NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
@@ -297,8 +579,11 @@ def load_optimizer(csv_text, solver=None):
         os.unlink(tmp_path)
 
 
-if dk_file is not None:
-    content = dk_file.getvalue().decode("utf-8-sig")
+if dk_content is not None:
+    content = dk_content
+    if salary_source == "DraftKings lobby" and cheatsheet_file is None:
+        st.info("The DraftKings lobby doesn't include average points, so add a "
+                "projections file — without one every player projects 0.")
 
     try:
         optimizer = load_optimizer(content)
@@ -351,10 +636,35 @@ if dk_file is not None:
         # --- Merge in cheatsheet projections if provided ---
         EXTRA_COLS = ["injury_status", "ppg_projection", "value_projection",
                       "L5_fppg_avg", "L10_fppg_avg"]
+        proj_label = "ppg_projection"
         if cheatsheet_file is not None:
             cheat_df = pd.read_csv(cheatsheet_file)
             cheat_cols = list(cheat_df.columns)   # before Name/_key are added
-            if {"first_name", "last_name"} <= set(cheat_df.columns):
+            # TwoGunGPT's Ceiling Board download: Projection/Median/Ceiling/Nuke
+            # instead of ppg_projection, and DraftKings IDs to match on.
+            is_twogun = {"Name", "Projection", "Median", "Ceiling", "Nuke"} <= set(cheat_cols)
+            if is_twogun:
+                proj_label = st.segmented_control(
+                    "Optimize on", ["Projection", "Median", "Ceiling", "Nuke"],
+                    default="Projection", required=True, key="twogun_target",
+                    help="TwoGunGPT file detected. Projection is his average game, "
+                         "Median his 50th percentile, Ceiling a top-20% game and Nuke "
+                         "a top-5% game. Ceiling or Nuke suits large-field GPPs.")
+                cheat_df["ppg_projection"] = cheat_df[proj_label]
+                # "Out ..." -> O, "Questionable (assumed playing)" -> Q, so the
+                # existing ruled-out filter applies.
+                status = cheat_df.get("Injury Status", pd.Series(index=cheat_df.index))
+                cheat_df["injury_status"] = (status.fillna("").astype(str).str.strip()
+                                             .str[:1].str.upper())
+                # Key by DraftKings ID where the salary file has it, so name
+                # spellings (Josh/Joshua, DST nicknames) can't break the match.
+                # The pool holds CPT and FLEX copies on showdown; both IDs map.
+                name_by_id = {str(p.id): p.full_name for p in players}
+                ids = (pd.to_numeric(cheat_df["ID"], errors="coerce").astype("Int64")
+                       .astype(str) if "ID" in cheat_df.columns
+                       else pd.Series("", index=cheat_df.index))
+                cheat_df["Name"] = ids.map(name_by_id).fillna(cheat_df["Name"])
+            if not is_twogun and {"first_name", "last_name"} <= set(cheat_df.columns):
                 # fillna before astype(str): a blank last_name (common for team
                 # defenses) would otherwise become the literal string "nan".
                 cheat_df["Name"] = (cheat_df["first_name"].fillna("").astype(str).str.strip()
@@ -370,8 +680,16 @@ if dk_file is not None:
             cheat_df["_key"] = cheat_df["Name"].map(normalize_name)
             # 1:1 merge — a repeated name would otherwise multiply player rows.
             cheat_df = cheat_df.drop_duplicates(subset="_key")
-            present = [c for c in EXTRA_COLS if c in cheat_df.columns]
-            missing = [c for c in EXTRA_COLS if c not in cheat_df.columns]
+            if is_twogun:
+                present = ["injury_status", "ppg_projection",
+                           "Projection", "Median", "Ceiling", "Nuke"]
+                present += [c for c in ("Ownership", "Small Field Ownership",
+                                        "CPT Ownership", "FLEX Ownership")
+                            if c in cheat_df.columns]
+                missing = []
+            else:
+                present = [c for c in EXTRA_COLS if c in cheat_df.columns]
+                missing = [c for c in EXTRA_COLS if c not in cheat_df.columns]
             if missing:
                 st.caption("Projection columns not in this file: " + ", ".join(missing))
             players_df["_key"] = players_df["Name"].map(normalize_name)
@@ -495,7 +813,7 @@ if dk_file is not None:
             counts = reason[drop_mask].value_counts().to_dict()
             detail = ", ".join(f"{v} {k}" for k, v in counts.items()) or "none"
             st.caption(
-                f"Optimizing on **ppg_projection** — {len(proj_map)} players. "
+                f"Optimizing on **{proj_label}** — {len(proj_map)} players. "
                 f"{len(unprojected_names)} removed ({detail})."
             )
             if unprojected_names:
@@ -527,6 +845,44 @@ if dk_file is not None:
                     "Those teams can never exceed the \"without its QB\" limit in section 4, "
                     "so game stacks may not be able to use them."
                 )
+
+        # --- Optimal %: how often each player is in a simulated game's best
+        # lineup. Beside projected ownership it reads as leverage.
+        opt_key = (hash(content), is_showdown,
+                   getattr(cheatsheet_file, "file_id", None) if cheatsheet_file else None)
+        if sport == "NFL" and cheatsheet_file is not None:
+            opt_runs = 2000 if is_showdown else 1000
+            with st.container(horizontal=True, vertical_alignment="center"):
+                if st.button("Calculate Optimal %", icon=":material/insights:",
+                             help=f"Simulates {opt_runs:,} games and solves each one's "
+                                  "highest-scoring legal lineup. Optimal % is how often a "
+                                  "player is in it; Leverage is Optimal % minus his "
+                                  "projected ownership — positive means the field is "
+                                  "likely underplaying him."):
+                    with st.spinner(f"Solving the best lineup in {opt_runs:,} simulated "
+                                    "games…"):
+                        opool = sim_pool(merged_df, players)
+                        opt, cpt = sim.optimal_rates(opool, sim.simulate(opool, opt_runs),
+                                                     n=opt_runs, showdown=is_showdown)
+                    st.session_state.optimal = {
+                        "key": opt_key, "runs": opt_runs,
+                        "opt": dict(zip(opool["Name"], opt.round(1))),
+                        "cpt": dict(zip(opool["Name"], cpt.round(1))) if cpt is not None
+                               else None}
+                stored = st.session_state.get("optimal")
+                if stored and stored["key"] == opt_key:
+                    st.caption(f"Optimal % from {stored['runs']:,} simulated games.")
+            stored = st.session_state.get("optimal")
+            if stored and stored["key"] == opt_key:
+                merged_df["Optimal %"] = merged_df["Name"].map(stored["opt"])
+                if stored["cpt"] is not None:
+                    merged_df["CPT opt %"] = merged_df["Name"].map(stored["cpt"])
+                own_ref = (pd.to_numeric(merged_df.get("Ownership"), errors="coerce")
+                           if is_showdown else
+                           blend_ownership(merged_df, field_entries)
+                           if "Ownership" in merged_df.columns else None)
+                if own_ref is not None:
+                    merged_df["Leverage"] = (merged_df["Optimal %"] - own_ref).round(1)
 
         st.subheader("2. Player Pool — set Lock / Exclude / Exposure per player")
 
@@ -614,6 +970,37 @@ if dk_file is not None:
                     "🎯 Max Exp %", min_value=0, max_value=100, step=5,
                     help="Blank = use the global cap. 0 removes the player entirely.",
                 ),
+                "Ownership": (st.column_config.NumberColumn(
+                    "Total own", format="%.1f%%",
+                    help="TwoGunGPT's projected ownership, captain and flex combined.")
+                    if is_showdown else st.column_config.NumberColumn(
+                    "Milly", format="%.1f%%",
+                    help="TwoGunGPT's projected ownership in a large-field (Milly Maker) "
+                         "contest.")),
+                "Optimal %": st.column_config.NumberColumn(
+                    "Optimal %", format="%.1f%%",
+                    help="Share of simulated games in which he's in that game's "
+                         "highest-scoring legal lineup."),
+                "CPT opt %": st.column_config.NumberColumn(
+                    "CPT opt %", format="%.1f%%",
+                    help="Share of simulated games in which he's the optimal captain."),
+                "Leverage": st.column_config.NumberColumn(
+                    "Leverage", format="%+.1f",
+                    help="Optimal % minus projected ownership (the contest tier's mix "
+                         "on a classic slate; total ownership on a showdown). Positive "
+                         "means the field likely underplays him."),
+                "CPT Ownership": st.column_config.NumberColumn(
+                    "CPT own", format="%.1f%%",
+                    help="TwoGunGPT's projected share of lineups with him at captain."),
+                "FLEX Ownership": st.column_config.NumberColumn(
+                    "FLEX own", format="%.1f%%",
+                    help="TwoGunGPT's projected share of lineups with him at flex."),
+                "Small Field Ownership": st.column_config.NumberColumn(
+                    "Small", format="%.1f%%",
+                    help="TwoGunGPT's projected ownership in a small-field contest."),
+                # DraftKings' season average — 0 from the lobby, and unused once a
+                # projections file sets the points, so it's hidden then.
+                **({"AvgPoints": None} if cheatsheet_file is not None else {}),
             },
             disabled=[c for c in view_df.columns if c not in EDITABLE],
             # The editor's diff is keyed by row position, so a changed filter must
@@ -666,6 +1053,123 @@ if dk_file is not None:
                     f"{name}: min exposure {min_exp[name]:.0f}% is above max "
                     f"{max_exp[name]:.0f}% — no lineup can satisfy both."
                 )
+
+        st.markdown("**Player combos**")
+        st.caption(
+            "Share of lineups in which every player on a row appears *together*. Set "
+            "Min and Max to the same value for an exact share — e.g. Bowers + Kelce at "
+            "20/20 puts the pair in 20% of lineups. Min alone forces at least that "
+            "many; Max alone caps how often the pair can show up. Each player's own "
+            "exposure limits still apply, so a combo can't exceed either player's max."
+        )
+        st.session_state.setdefault("combo_rows", [])
+        st.session_state.setdefault("combo_nonce", 0)
+        pool_names = sorted(merged_df["Name"].unique())
+        combo_df = pd.DataFrame(
+            [{"Players": r["players"], "Min %": r["min"], "Max %": r["max"]}
+             for r in st.session_state.combo_rows],
+            columns=["Players", "Min %", "Max %"])
+        combo_df["Min %"] = combo_df["Min %"].astype("Float64")
+        combo_df["Max %"] = combo_df["Max %"].astype("Float64")
+        edited_combos = st.data_editor(
+            combo_df,
+            num_rows="dynamic",
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Players": st.column_config.MultiselectColumn(
+                    "Players", options=pool_names, width="large", required=True,
+                    help="Two or more players who must appear together."),
+                "Min %": st.column_config.NumberColumn(
+                    "Min %", min_value=0, max_value=100, step=5,
+                    help="At least this share of lineups contain all of them."),
+                "Max %": st.column_config.NumberColumn(
+                    "Max %", min_value=0, max_value=100, step=5,
+                    help="At most this share of lineups contain all of them. "
+                         "0 means never together."),
+            },
+            key=f"combo_editor_{st.session_state.combo_nonce}",
+        )
+        collected_combos = []
+        for _, row in edited_combos.iterrows():
+            names = row["Players"]
+            names = [str(n) for n in names] if isinstance(names, (list, tuple)) else []
+            if not names:
+                continue
+            collected_combos.append({
+                "players": sorted(set(names)),
+                "min": float(row["Min %"]) if pd.notna(row["Min %"]) else None,
+                "max": float(row["Max %"]) if pd.notna(row["Max %"]) else None,
+            })
+        if collected_combos != st.session_state.combo_rows:
+            st.session_state.combo_rows = collected_combos
+            st.session_state.combo_nonce += 1
+            st.rerun()
+
+        name_positions = {n: str(p).split("/")
+                          for n, p in zip(merged_df["Name"], merged_df["Position"])}
+
+        def combo_fits(names, flex=None):
+            """Can these players share one roster when the flex is forced to `flex`?
+
+            Two TEs need the flex to take one of them, so a combo like Bowers +
+            Kelce is impossible in a batch that forces an RB or WR into the flex.
+            Showdown slots take any position, so everything fits there.
+            """
+            if is_showdown:
+                return True
+            slots = [([flex] if flex and len(slot.positions) > 1 else list(slot.positions))
+                     for slot in optimizer.settings.positions]
+
+            def place(i, free):
+                if i == len(names):
+                    return True
+                for j in free:
+                    if set(name_positions.get(names[i], ())) & set(slots[j]):
+                        if place(i + 1, free - {j}):
+                            return True
+                return False
+
+            return place(0, frozenset(range(len(slots))))
+
+        # Only rows that can actually constrain anything reach the optimizer.
+        player_combos = []
+        for idx, row in enumerate(st.session_state.combo_rows, start=1):
+            label = " + ".join(row["players"])
+            if len(row["players"]) < 2:
+                st.warning(f"Combo {idx}: pick at least two players.")
+                continue
+            if row["min"] is None and row["max"] is None:
+                st.warning(f"Combo {idx} ({label}): set a Min %, a Max %, or both.")
+                continue
+            if row["min"] is not None and row["max"] is not None and row["min"] > row["max"]:
+                st.warning(f"Combo {idx} ({label}): min {row['min']:.0f}% is above max "
+                           f"{row['max']:.0f}%.")
+                continue
+            if not combo_fits(row["players"]):
+                st.warning(f"Combo {idx} ({label}): those positions can't all fit in "
+                           "one roster.")
+                continue
+            gone = [n for n in row["players"] if n in excluded_names]
+            if gone:
+                st.warning(f"Combo {idx} ({label}): {', '.join(gone)} excluded, so the "
+                           "combo is skipped.")
+                continue
+            if row["min"]:
+                low = [n for n in row["players"]
+                       if max_exp.get(n, global_max_exp) < row["min"]]
+                if low:
+                    st.warning(f"Combo {idx} ({label}): {', '.join(low)} capped below "
+                               f"{row['min']:.0f}% — the combo min can't be reached.")
+            player_combos.append(row)
+            if row["min"] is not None and row["min"] == row["max"]:
+                desc = f"exactly {row['min']:.0f}%"
+            else:
+                desc = " and ".join(filter(None, [
+                    f"at least {row['min']:.0f}%" if row["min"] else None,
+                    f"at most {row['max']:.0f}%" if row["max"] is not None else None,
+                ]))
+            st.caption(f"Combo {idx}: {label} together in {desc} of lineups")
 
         if is_showdown:
             st.markdown("**Showdown**")
@@ -889,6 +1393,7 @@ if dk_file is not None:
                 key=lambda x: available_positions.index(x) if x in available_positions else 99)
 
             qs_rows = []
+            rb_stack_pct = 0
             if not has_game_info:
                 st.warning("QB stacks need the **Game Info** column — see section 3.")
             else:
@@ -941,6 +1446,14 @@ if dk_file is not None:
                     st.session_state.qs_nonce += 1
                     st.rerun()
                 qs_rows = st.session_state.qs_rows
+                if any(r["qb_side"] > 1 for r in qs_rows):
+                    rb_stack_pct = st.number_input(
+                        "QB + RB stacks %", min_value=0, max_value=100, value=5, step=5,
+                        key="rb_stack_pct",
+                        help="Share of stacked lineups whose QB is paired with his own RB. "
+                             "Every other stack pairs him only with WRs/TEs, and bring-backs "
+                             "are always WR/TE. A QB's score barely moves with his RB's "
+                             "(r ~0.05, vs ~0.35 for his receivers), so keep this low.")
 
             # Validate each row against the per-team limits from section 4.
             qb_stack_specs = []
@@ -970,7 +1483,12 @@ if dk_file is not None:
                 "to let the optimizer choose — which tends to produce no WRs, because the "
                 "good ones are already in the three dedicated WR slots."
             )
-            st.session_state.setdefault("flex_rows", [])
+            # Default flex mix: RB 45%, WR 33%, TE 22% (the user's split).
+            st.session_state.setdefault("flex_rows", [
+                {"position": "RB", "share": 45.0},
+                {"position": "WR", "share": 33.0},
+                {"position": "TE", "share": 22.0},
+            ])
             st.session_state.setdefault("flex_nonce", 0)
             flex_df = pd.DataFrame(
                 [{"Position": r["position"], "Share %": r["share"]}
@@ -1031,19 +1549,39 @@ if dk_file is not None:
             qsum = sum(w for _, w in qb_units)
             fsum = sum(w for _, w in flex_units)
 
+            # Partner mix: each stacked batch splits into a WR/TE-partner slice
+            # and a QB + RB slice. In the RB slice only the first stack that has
+            # a teammate takes the RB, so one lineup holds one QB + RB pairing.
+            def with_partner(specs, partner):
+                out, used = [], False
+                for s in specs:
+                    take = partner == "rb" and not used and s["qb_side"] > 1
+                    used |= take
+                    out.append({**s, "partner": "rb" if take else "pass"})
+                return out
+
+            rb_share = rb_stack_pct / 100
             batch_plan = []
             for spec, qw in qb_units:
-                for pos, fw in flex_units:
-                    batch_plan.append({
-                        "specs": [spec] if spec else qb_stack_specs,
-                        "flex": pos,
-                        "weight": (qw / qsum) * (fw / fsum),
-                        "label": " / ".join(filter(None, [
-                            (f"QB + {spec['qb_side'] - 1} + {spec['bring_back']} back"
-                             if spec else None),
-                            (f"flex {pos}" if pos else None),
-                        ])) or "all rules together",
-                    })
+                specs = [spec] if spec else qb_stack_specs
+                stacked = any(s["qb_side"] > 1 for s in specs)
+                partners = ([("pass", 1 - rb_share), ("rb", rb_share)] if stacked
+                            else [("pass", 1.0)])
+                for partner, pw in partners:
+                    if pw <= 0:
+                        continue
+                    for pos, fw in flex_units:
+                        batch_plan.append({
+                            "specs": with_partner(specs, partner),
+                            "flex": pos,
+                            "weight": (qw / qsum) * (fw / fsum) * pw,
+                            "label": " / ".join(filter(None, [
+                                (f"QB + {spec['qb_side'] - 1} + {spec['bring_back']} back"
+                                 if spec else None),
+                                ("QB + RB" if partner == "rb" else None),
+                                (f"flex {pos}" if pos else None),
+                            ])) or "all rules together",
+                        })
 
             mix_mode = len(batch_plan) > 1
             raw = [b["weight"] * num_lineups for b in batch_plan]
@@ -1078,6 +1616,34 @@ if dk_file is not None:
                 else:
                     st.caption(f"Using {needed} of {roster_slots} roster spots — these rows apply "
                                "together, each on a different game.")
+
+        # A combo can only be built in batches whose forced flex leaves room for
+        # it, so its whole target has to come out of those batches.
+        for row in player_combos:
+            room = sum(b["count"] for b in batch_plan
+                       if combo_fits(row["players"], b.get("flex")))
+            label = " + ".join(row["players"])
+            need = int((row["min"] or 0) / 100 * num_lineups + 0.5)
+            if room < num_lineups:
+                flexes = sorted({b["flex"] for b in batch_plan
+                                 if b.get("flex") and combo_fits(row["players"], b["flex"])})
+                st.caption(f"{label} only fits when the flex is "
+                           f"{' or '.join(flexes) or 'free'}, so it's built in those "
+                           f"{room} lineups.")
+            if need > room:
+                st.warning(f"{label}: min {row['min']:.0f}% needs {need} lineups but only "
+                           f"{room} have a flex that fits both — it will fall short.")
+            elif room < num_lineups and need:
+                # Exposure caps apply inside each batch, so a player capped at
+                # 50% can fill at most half of the batches the combo fits in.
+                cap = min(max_exp.get(n, global_max_exp) for n in row["players"])
+                if need > room * cap / 100 + 0.5:
+                    st.warning(
+                        f"{label}: min {row['min']:.0f}% needs {need} of those {room} "
+                        f"lineups ({need / room:.0%}), but a {cap:.0f}% max exposure is "
+                        f"applied inside each batch, so it tops out near "
+                        f"{int(room * cap / 100 + 0.5)}. Raise the flex share or those "
+                        "players' Max Exp %.")
 
         st.subheader(("4." if is_showdown else "6.") + " Generate Lineups")
         if st.button("Generate Lineups"):
@@ -1186,6 +1752,7 @@ if dk_file is not None:
                 stack = build_qb_stack(
                     opt.player_pool, spec["qb_side"], spec["bring_back"],
                     max_exposure=spec["max_exp"] / 100 if spec["max_exp"] else None,
+                    partner=spec.get("partner", "pass"),
                 )
                 if stack is None:
                     if report:
@@ -1198,8 +1765,14 @@ if dk_file is not None:
                         st.warning(f"QB stack skipped: {exc}")
 
 
-            def make_optimizer(specs, solver, report, flex=None, captain=None):
+            def make_optimizer(specs, solver, report, flex=None, captain=None, combos=None,
+                               shares=None, count=None):
                 opt = configure_optimizer(report=report, solver=solver)
+                if shares is not None:
+                    apply_batch_shares(opt, shares, count)
+                if combos:
+                    opt.player_combos = combos
+                    opt.add_new_rule(PlayerComboRule)
                 if captain:
                     # Every player sits in the pool twice. Dropping the CPT copy
                     # of anyone at another position leaves only this position
@@ -1216,7 +1789,8 @@ if dk_file is not None:
                     add_qb_stack(opt, spec, report=report)
                 return opt
 
-            def run_batch(specs, count, report=True, exclude=(), flex=None, captain=None):
+            def run_batch(specs, count, report=True, exclude=(), flex=None, captain=None,
+                          idx=None):
                 """Solve on the fast engine, fall back to the library default.
 
                 The fallback exists for the error message: PuLP names the
@@ -1225,9 +1799,18 @@ if dk_file is not None:
                 each batch is its own optimizer run, so without it the same
                 roster can come back twice.
                 """
+                combos = combo_targets(exclude, count, idx)
+                shares = exposure_shares(exclude, count) if idx is not None else None
+
                 def attempt(solver, report_):
-                    opt = make_optimizer(specs, solver, report_, flex, captain)
+                    opt = make_optimizer(specs, solver, report_, flex, captain, combos,
+                                         shares, count)
                     kwargs = dict(optimize_kwargs)
+                    if shares is not None:
+                        # Caps are now this batch's own counts, which only mean
+                        # what they say when measured against the batch total.
+                        kwargs.pop("max_exposure", None)
+                        kwargs["exposure_strategy"] = TotalExposureStrategy
                     if exclude:
                         # Batches can have different pools — forcing a captain
                         # position drops the other CPT copies. The library looks
@@ -1246,6 +1829,88 @@ if dk_file is not None:
                     except LineupOptimizerException:
                         pass
                 return attempt(None, report)
+
+            def exposure_shares(prior, count):
+                """Each player's min and max lineup counts for one batch of a mix.
+
+                The library applies exposure inside each optimizer run, and a run
+                of 4 lineups can't hold anyone under 25% — one appearance already
+                is 1 in 4. Across nine small batches a 10% cap came out at 13%.
+                So the caps are converted to counts on a cumulative schedule: by
+                the end of this batch a player may have at most ceil(cap x lineups
+                so far), minus what earlier batches already used. Mins follow the
+                same schedule, so they never ask for more than the max allows.
+                """
+                upto = len(prior) + count
+                used = Counter(pl.full_name for lu in prior for pl in lu.players)
+                caps, mins = {}, {}
+                for nm in merged_df["Name"]:
+                    if nm in locked_names:
+                        continue
+                    pct = max_exp.get(nm, global_max_exp if global_max_exp < 100 else None)
+                    if pct is not None:
+                        caps[nm] = max(-(-(pct / 100 * upto - 1e-9) // 1) - used[nm], 0)
+                    if min_exp.get(nm):
+                        need = int(min_exp[nm] / 100 * upto + 0.5) - used[nm]
+                        mins[nm] = min(max(need, 0), count, caps.get(nm, count))
+                return {"max": caps, "min": mins}
+
+            def apply_batch_shares(opt, shares, count):
+                """Swap the library's percentage caps for this batch's counts."""
+                by_name = defaultdict(list)
+                for pl in opt.player_pool.all_players:
+                    by_name[pl.full_name].append(pl)
+                combined = {}
+                for nm, copies in by_name.items():
+                    allowed = shares["max"].get(nm)
+                    need = shares["min"].get(nm)
+                    if allowed == 0:
+                        # A cap of 0 reads as "no cap" to the library, so a
+                        # player with nothing left is taken out of the batch.
+                        for pl in copies:
+                            opt.player_pool.remove_player(pl)
+                        continue
+                    for pl in copies:
+                        pl.max_exposure = (None if is_showdown or allowed is None
+                                           else allowed / count)
+                        pl.min_exposure = need / count if need else None
+                    if is_showdown and allowed is not None:
+                        combined[nm] = allowed / count
+                if is_showdown:
+                    opt.combined_exposure = combined
+
+            def combo_targets(prior, count, idx=None):
+                """Turn each combo's percentages into lineup counts for one run.
+
+                Targets are cumulative: a batch gets whatever the run so far still
+                owes, so the overall share holds even when the lineups are split
+                into small batches that would each round badly on their own. The
+                schedule only advances through batches whose flex can hold the
+                combo — the rest owe nothing, and the ones that can make it up.
+                """
+                plan = batch_plan if idx is not None else [{"count": count, "flex": None}]
+                at = idx or 0
+                out = []
+                for row in player_combos:
+                    wanted = set(row["players"])
+                    done = sum(1 for lu in prior
+                               if wanted <= {pl.full_name for pl in lu.players})
+                    fits = [combo_fits(row["players"], b.get("flex")) for b in plan]
+                    room = sum(b["count"] for b, f in zip(plan, fits) if f) or 1
+                    upto = sum(b["count"] for b, f in zip(plan[:at + 1], fits) if f)
+                    total_n = sum(b["count"] for b in plan)
+
+                    def owed(pct):
+                        if not fits[at]:
+                            return 0
+                        return min(max(int(pct / 100 * total_n * upto / room + 0.5)
+                                       - done, 0), count)
+                    out.append({
+                        "players": row["players"],
+                        "min_count": owed(row["min"]) if row["min"] else None,
+                        "max_count": owed(row["max"]) if row["max"] is not None else None,
+                    })
+                return out
 
             optimize_kwargs = {"exposure_strategy": strategy_map[strategy_label]}
             if global_max_exp < 100 and not is_showdown:
@@ -1282,6 +1947,8 @@ if dk_file is not None:
                     "QB stacks": [(r["qb_side"], r["bring_back"], r.get("share"),
                                    r["max_exp"]) for r in qb_stack_specs],
                     "Flex mix": [(r["position"], r["share"]) for r in flex_rows],
+                    "Player combos": [(r["players"], r["min"], r["max"])
+                                      for r in player_combos],
                 }
                 with st.expander("Diagnostics — the exact settings in play", expanded=True):
                     st.code("\n".join(f"{k}: {v}" for k, v in info.items()), language="text")
@@ -1291,13 +1958,25 @@ if dk_file is not None:
                 "- Same-team restrictions that leave no valid roster\n"
                 "- A QB stack shape larger than the per-team limits in section 4 allow\n"
                 "- Min exposure totals that exceed the roster, or too few players left "
-                "after excludes\n\n"
+                "after excludes\n"
+                "- A player combo whose min is above one of its players' max exposure, "
+                "or that can't fit under the per-team limits\n\n"
                 "The reported constraint names come from the solver and often point at "
                 "knock-on effects rather than the rule you actually set."
             )
 
             run_started = time.time()
-            progress = st.status(f"Building {num_lineups} lineups…", expanded=True)
+            # Simulation builds sim_mult candidates per lineup, batch by batch, and
+            # picks the final set from them afterwards.
+            build_n = num_lineups * sim_mult if sim_on else num_lineups
+            for b in batch_plan:
+                b["keep"] = b["count"]
+                if sim_on:
+                    b["count"] *= sim_mult
+            batch_of = []
+            progress = st.status(
+                f"Building {build_n:,} lineups to keep the best {num_lineups}…" if sim_on
+                else f"Building {num_lineups} lineups…", expanded=True)
 
             if mix_mode:
                 # One optimizer run per (stack shape x flex position) combination.
@@ -1312,22 +1991,120 @@ if dk_file is not None:
                     try:
                         batch = run_batch(b["specs"], b["count"], report=(idx == 0),
                                           exclude=lineups, flex=b["flex"],
-                                          captain=b.get("captain"))
+                                          captain=b.get("captain"), idx=idx)
                     except LineupOptimizerException as exc:
                         st.error(f"**\"{b['label']}\" failed:** {exc}\n\n" + trouble)
                         show_diagnostics()
                         st.stop()
                     lineups.extend(batch)
+                    batch_of.extend([idx] * len(batch))
                     mix_report.append({"Rule": b["label"], "Share %":
                                        round(b["weight"] * 100, 1), "Lineups": len(batch)})
             else:
-                progress.write(f"solving {num_lineups} lineups…")
+                progress.write(f"solving {build_n} lineups…")
                 try:
-                    lineups = run_batch(qb_stack_specs, num_lineups)
+                    lineups = run_batch(qb_stack_specs, build_n)
                 except LineupOptimizerException as exc:
                     st.error(f"**Couldn't generate lineups:** {exc}\n\n" + trouble)
                     show_diagnostics()
                     st.stop()
+                batch_of = [0] * len(lineups)
+                batch_plan[0]["keep"] = num_lineups
+
+            sim_df = sim_note = None
+            if sim_on and lineups:
+                progress.write(f"simulating the slate {sim_runs:,} times…")
+                pool_df = sim_pool(merged_df, players)
+                row_of = {n: i for i, n in enumerate(pool_df["Name"])}
+                sims = sim.simulate(pool_df, sim_runs)
+                members = [[(row_of[p.full_name], 1.5 if p.lineup_position == "CPT" else 1.0)
+                            for p in lu.players if p.full_name in row_of] for lu in lineups]
+                scores = sim.score_lineups(members, sims)
+
+                # The field: simulated opponents drawn from projected ownership —
+                # Milly/small-field on a classic slate, CPT/FLEX on a showdown —
+                # whenever the projections file carries it.
+                has = lambda c: c in pool_df.columns and pool_df[c].notna().any()
+                field_on = (has("CPT Ownership") and has("FLEX Ownership") if is_showdown
+                            else has("Ownership"))
+                thresh = fresh_thresh = share = None
+                if field_on:
+                    progress.write("simulating the field from projected ownership…")
+                    # The field draws from salaried players; its row numbers are
+                    # positions in that subset, mapped back to pool rows after.
+                    salaried = np.flatnonzero(pool_df["Salary"].notna().to_numpy())
+                    sub = pool_df.iloc[salaried].reset_index(drop=True)
+                    if is_showdown:
+                        cpt_own = pool_df["CPT Ownership"].fillna(0).to_numpy()
+                        flex_own = pool_df["FLEX Ownership"].fillna(0).to_numpy()
+                        f_cpt, f_flex, field_err = sim.build_showdown_field(
+                            sub, sub["CPT Ownership"].to_numpy(),
+                            sub["FLEX Ownership"].to_numpy(), n=FIELD_LINEUPS)
+                        field_members = [[(salaried[c], 1.5)] + [(salaried[i], 1.0) for i in f]
+                                         for c, f in zip(f_cpt, f_flex)]
+                        # A captain's ownership is his CPT share, a flex player's
+                        # his FLEX share.
+                        slot_own = lambda i, mult: cpt_own[i] if mult > 1 else flex_own[i]
+                    else:
+                        pool_df["Own"] = blend_ownership(pool_df, field_entries)
+                        own_arr = pool_df["Own"].fillna(0).to_numpy()
+                        field, field_err = sim.build_field(
+                            sub, pool_df["Own"].to_numpy()[salaried], n=FIELD_LINEUPS)
+                        field_members = [[(salaried[i], 1.0) for i in row] for row in field]
+                        slot_own = lambda i, mult: own_arr[i]
+                    thresh = np.quantile(sim.score_lineups(field_members, sims),
+                                         1 - sim_top, axis=0)
+                    lineup_own = [[slot_own(i, mult) for i, mult in m] for m in members]
+                    dupes = sim.expected_duplicates(lineup_own, field_entries)
+                    share = 1 / (1 + dupes)
+
+                names = [{p.full_name for p in lu.players} for lu in lineups]
+                caps = {}
+                for nm in merged_df["Name"]:
+                    pct = max_exp.get(nm, global_max_exp if global_max_exp < 100 else None)
+                    if pct is not None and nm not in locked_names:
+                        caps[nm] = -(-(pct / 100 * num_lineups - 1e-9) // 1)
+                batches = [([i for i, bi in enumerate(batch_of) if bi == idx], b["keep"])
+                           for idx, b in enumerate(batch_plan) if b.get("keep")]
+                chosen, info = sim.select(scores, batches, names, top_q=sim_top, caps=caps,
+                                          thresh=thresh, share=share)
+
+                # Graded on a fresh set of sims, against what the optimizer alone
+                # would have kept (each batch's first lineups). Grading on the sims
+                # the picks were chosen on would flatter them.
+                base = [c for cands, keep in batches for c in cands[:keep]]
+                fresh_sims = sim.simulate(pool_df, sim_runs)
+                fresh = sim.score_lineups(members, fresh_sims)
+                if field_on:
+                    fresh_thresh = np.quantile(sim.score_lineups(field_members, fresh_sims),
+                                               1 - sim_top, axis=0)
+                sim_note = {
+                    "candidates": len(lineups), "runs": sim_runs, "top": sim_top,
+                    "covered": sim.coverage(fresh, chosen, sim_top, fresh_thresh),
+                    "baseline": sim.coverage(fresh, base, sim_top, fresh_thresh),
+                    "over_cap": info["over_cap"],
+                    "field": ({"lineups": len(field_members), "entries": field_entries,
+                               "error": field_err,
+                               "which": ("TwoGunGPT's CPT/FLEX ownership" if is_showdown
+                                         else ownership_label(field_entries))}
+                              if field_on else None),
+                }
+                sel = scores[chosen].astype(float)
+                sim_df = pd.DataFrame({
+                    "Lineup": range(1, len(chosen) + 1),
+                    "Optimizer pts": [round(lineups[c].fantasy_points_projection, 1)
+                                   for c in chosen],
+                    "Sim avg": sel.mean(axis=1).round(1),
+                    "Sim 90th": np.quantile(sel, 0.9, axis=1).round(1),
+                    "Sim 99th": np.quantile(sel, 0.99, axis=1).round(1),
+                    f"Top {sim_top:.1%} rate": (info["rate"][chosen] * 100).round(2),
+                })
+                if field_on:
+                    sim_df["Total own %"] = [round(sum(lineup_own[c]), 1) for c in chosen]
+                    sim_df["Exp. duplicates"] = dupes[chosen].round(2)
+                for i in range(len(mix_report)):
+                    mix_report[i]["Lineups"] = sum(1 for c in chosen if batch_of[c] == i)
+                lineups = [lineups[c] for c in chosen]
 
             for i, lineup in enumerate(lineups, start=1):
                 for player in lineup.players:
@@ -1347,7 +2124,9 @@ if dk_file is not None:
                 })
 
             elapsed = time.time() - run_started
-            progress.update(label=f"Built {len(lineups)} lineups in {elapsed:.1f}s",
+            progress.update(label=(f"Kept the best {len(lineups)} of {build_n:,} lineups "
+                                   f"in {elapsed:.1f}s" if sim_df is not None
+                                   else f"Built {len(lineups)} lineups in {elapsed:.1f}s"),
                             state="complete", expanded=False)
 
             # Stash the results: rendering happens outside the button block so a
@@ -1362,9 +2141,34 @@ if dk_file is not None:
             # real position, not the roster slot the player filled (FLEX etc.)
             real_pos = dict(zip(merged_df["Name"], merged_df["Position"]))
             exposure_df.insert(1, "Position", exposure_df["Name"].map(real_pos))
+            stored = st.session_state.get("optimal")
+            if stored and stored["key"] == opt_key:
+                exposure_df["Optimal %"] = exposure_df["Name"].map(stored["opt"])
+            if "Ownership" in merged_df.columns:
+                own_now = (pd.to_numeric(merged_df["Ownership"], errors="coerce")
+                           if is_showdown else blend_ownership(merged_df, field_entries))
+                exposure_df["Proj own %"] = exposure_df["Name"].map(
+                    dict(zip(merged_df["Name"], own_now.round(1))))
             exposure_df["Min set %"] = exposure_df["Name"].map(min_exp)
             exposure_df["Max set %"] = exposure_df["Name"].map(max_exp)
             exposure_df = exposure_df.sort_values("Lineups", ascending=False)
+
+            # Showdown: the same player split by the slot they filled. The 1.5x
+            # captain is the biggest single call, so it gets its own breakdown.
+            captain_df = None
+            if is_showdown:
+                slot = picks["Position"].eq("CPT").map({True: "CPT", False: "FLEX"})
+                captain_df = (pd.crosstab([picks["Name"], picks["Team"]], slot)
+                              .reindex(columns=["CPT", "FLEX"], fill_value=0)
+                              .rename_axis(columns=None)
+                              .reset_index())
+                captain_df.insert(1, "Position", captain_df["Name"].map(real_pos))
+                captain_df["CPT %"] = (captain_df["CPT"] / total * 100).round(1)
+                captain_df["FLEX %"] = (captain_df["FLEX"] / total * 100).round(1)
+                captain_df["Total %"] = captain_df["CPT %"] + captain_df["FLEX %"]
+                captain_df = (captain_df[["Name", "Position", "Team", "CPT", "CPT %",
+                                          "FLEX", "FLEX %", "Total %"]]
+                              .sort_values(["CPT", "Total %"], ascending=False))
 
             # DK upload format: one row per lineup, one column per roster slot,
             # each cell the salary file's own "Name + ID" string.
@@ -1414,6 +2218,20 @@ if dk_file is not None:
                                .reset_index().sort_values("Lineups", ascending=False))
                     flex_df["% of lineups"] = (flex_df["Lineups"] / total * 100).round(1)
 
+            # How often each combo actually came out, against what was asked.
+            combo_df = None
+            if player_combos:
+                lineup_sets = [set(g["Name"]) for _, g in picks.groupby("Lineup")]
+                combo_df = pd.DataFrame([{
+                    "Combo": " + ".join(r["players"]),
+                    "Lineups": sum(1 for names in lineup_sets
+                                   if set(r["players"]) <= names),
+                    "Min set %": r["min"],
+                    "Max set %": r["max"],
+                } for r in player_combos])
+                combo_df.insert(2, "Exposure %",
+                                (combo_df["Lineups"] / total * 100).round(1))
+
             mix_df = None
             if mix_report:
                 mix_df = pd.DataFrame(mix_report)
@@ -1428,6 +2246,10 @@ if dk_file is not None:
                 "upload": upload_df,
                 "teams": team_df,
                 "flex": flex_df,
+                "captains": captain_df,
+                "combos": combo_df,
+                "sim": sim_df,
+                "sim_note": sim_note,
             }
 
         results = st.session_state.get("results")
@@ -1437,19 +2259,85 @@ if dk_file is not None:
                 st.caption(f"Built at **{results['built_at']}** in "
                            f"{results['took']:.1f}s. Generating again gives a different set "
                            "whenever randomness is on.")
+
+            # Player pool actually used: distinct names across every lineup.
+            used = results["lineups"]
+            used = used.loc[used["Position"] != "TOTAL", "Name"].drop_duplicates()
+            pos_of = dict(zip(merged_df["Name"], merged_df["Position"]))
+            # First listed position only, so a WR/RB isn't counted twice.
+            used_pos = Counter(str(pos_of.get(n, "?")).split("/")[0] for n in used)
+            with st.container(horizontal=True):
+                st.metric("Lineups", int(results["lineups"]["Lineup"].max()),
+                          border=True, width="content")
+                st.metric("Player pool", len(used), border=True, width="content",
+                          help="Unique players across all lineups.")
+                for pos in order_positions(used_pos, sport):
+                    st.metric(pos, used_pos[pos], border=True, width="content")
+
             st.dataframe(results["lineups"], width="stretch")
+
+            if results.get("sim") is not None:
+                note = results["sim_note"]
+                st.subheader("Simulation")
+                with st.container(horizontal=True):
+                    st.metric(f"Any lineup in top {note['top']:.1%}", f"{note['covered']:.0%}",
+                              delta=f"{(note['covered'] - note['baseline']) * 100:+.0f} pts "
+                                    "vs optimizer order",
+                              help="Share of simulated slates in which at least one of your "
+                                   "lineups finishes in the target slice (of the simulated "
+                                   "field when there is one, else of all lineups built). "
+                                   "The comparison is the same number of lineups taken in "
+                                   "the order the optimizer built them. Both are graded on "
+                                   "a second, independent set of sims.")
+                    st.metric("Lineups compared", f"{note['candidates']:,}")
+                    st.metric("Simulations", f"{note['runs']:,}")
+                if note.get("field"):
+                    fld = note["field"]
+                    st.caption(
+                        f"Judged against **{fld['lineups']:,} simulated opponents** built from "
+                        f"{fld['which']} ({fld['entries']:,}-entry contest; their player "
+                        f"exposures match it to within {fld['error']:.1f} pts). A hit is a "
+                        f"lineup scoring in the field's top {note['top']:.1%}, and it counts "
+                        "less the more copies of it the field is expected to enter.")
+                else:
+                    st.caption("No ownership in the projections file, so lineups are judged "
+                               "against each other rather than a simulated field.")
+                if note.get("over_cap"):
+                    over = ", ".join(f"{n} ({k})" for n, k in note["over_cap"].items())
+                    st.warning(f"No set of the lineups built kept everyone under their exposure cap, "
+                               f"so these players are over it (lineups shown): {over}. Loosen "
+                               "their caps or build and compare more lineups.")
+                st.caption("Per lineup: its simulated average, 90th and 99th percentile "
+                           "scores, and how often it lands in the target slice.")
+                st.dataframe(results["sim"], width="content", hide_index=True)
 
             if results["mix"] is not None:
                 st.subheader("Stack Mix")
                 st.dataframe(results["mix"], width="content", hide_index=True)
 
             if results.get("upload") is not None:
-                st.download_button(
-                    "⬇️ Download DK upload CSV",
-                    results["upload"].to_csv(index=False),
-                    "dk_upload.csv", "text/csv", type="primary",
-                    help="One row per lineup, one column per roster slot, "
-                         "with the DK player IDs — ready to upload.")
+                with st.container(horizontal=True):
+                    st.download_button(
+                        "⬇️ Download DK upload CSV",
+                        results["upload"].to_csv(index=False),
+                        "dk_upload.csv", "text/csv", type="primary",
+                        help="One row per lineup, one column per roster slot, "
+                             "with the DK player IDs — ready to upload.")
+                    st.link_button(
+                        "Upload lineups to DraftKings", "https://www.draftkings.com/lineup/upload",
+                        icon=":material/open_in_new:",
+                        help="DraftKings' lineup upload page — choose the dk_upload.csv "
+                             "you just downloaded.")
+                    st.link_button(
+                        "My Contests", "https://www.draftkings.com/mycontests",
+                        icon=":material/open_in_new:",
+                        help="After the games: open a finished contest and export the "
+                             "standings CSV, so the sim's ownership and duplicate models "
+                             "can be checked against what really happened.")
+
+            if results.get("combos") is not None:
+                st.subheader("Player Combos")
+                st.dataframe(results["combos"], width="content", hide_index=True)
 
             st.subheader("Exposure Summary")
             exp = results["exposure"]
@@ -1470,6 +2358,62 @@ if dk_file is not None:
             else:
                 shown = exp
             st.dataframe(shown, width="stretch", hide_index=True)
+
+            if is_showdown and results.get("captains") is not None:
+                st.subheader("Captain Exposure")
+                caps_df = results["captains"]
+                st.caption(
+                    f"{int((caps_df['CPT'] > 0).sum())} different captains across "
+                    f"{int(results['lineups']['Lineup'].max())} lineups. **CPT** and **FLEX** count the "
+                    "lineups where the player filled that slot; a player is never both "
+                    "in one lineup, so **Total %** is their overall exposure.")
+                st.dataframe(caps_df, width="stretch", hide_index=True,
+                             column_config={
+                                 "CPT %": st.column_config.ProgressColumn(
+                                     "CPT %", format="%.1f%%", min_value=0, max_value=100),
+                             })
+
+            st.subheader("Common Combos")
+            st.caption("Groups of players that land in the same lineup most often, "
+                       "whichever slots they fill.")
+            lineup_df = results["lineups"]
+            n_built = int(lineup_df["Lineup"].max())
+            with st.container(horizontal=True, vertical_alignment="bottom"):
+                combo_size = st.segmented_control(
+                    "Group size", [2, 3, 4], default=2, key="combo_size",
+                    format_func=lambda k: {2: "Pairs", 3: "Trios", 4: "Foursomes"}[k])
+                must_have = st.multiselect(
+                    "Containing", sorted(lineup_df.loc[lineup_df["Position"] != "TOTAL",
+                                                       "Name"].unique()),
+                    key="combo_must_have", placeholder="Any player",
+                    help="Only show groups that include all of these players.")
+                min_seen = st.number_input(
+                    "Seen in at least", min_value=1, max_value=max(n_built, 1), value=2,
+                    key="combo_min_seen", help="Lineups. Hides one-off groups.")
+            combo_size = combo_size or 2
+            if len(must_have) > combo_size:
+                st.caption(f"{len(must_have)} players can't all fit in a group of "
+                           f"{combo_size}.")
+            else:
+                pos_of = dict(zip(merged_df["Name"], merged_df["Position"]))
+                team_of = dict(zip(lineup_df["Name"], lineup_df["Team"]))
+                wanted = set(must_have)
+                rows = [{
+                    "Players": " + ".join(group),
+                    "Positions": " / ".join(str(pos_of.get(n, "?")) for n in group),
+                    "Teams": " / ".join(str(team_of.get(n, "?")) for n in group),
+                    "Lineups": seen,
+                    "Exposure %": round(seen / n_built * 100, 1),
+                } for group, seen in count_combos(lineup_df, combo_size).items()
+                    if seen >= min_seen and wanted <= set(group)]
+                if rows:
+                    top = (pd.DataFrame(rows)
+                           .sort_values(["Lineups", "Players"], ascending=[False, True])
+                           .reset_index(drop=True))
+                    st.caption(f"{len(top)} groups. Showing the most common first.")
+                    st.dataframe(top, width="stretch", hide_index=True, height=420)
+                else:
+                    st.caption("No groups match.")
 
             tcol, fcol = st.columns([3, 2])
             with tcol:
