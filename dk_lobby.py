@@ -22,6 +22,12 @@ COLUMNS = ["Position", "Name + ID", "Name", "ID", "Roster Position", "Salary",
            "Game Info", "TeamAbbrev", "AvgPointsPerGame"]
 
 
+def clock(t, prefix=""):
+    """'Sun 1:00 PM' — the hour without a leading zero. strftime's %-I does
+    that only on Mac/Linux, so the zero is stripped by hand for Windows."""
+    return t.strftime(prefix) + t.strftime("%I:%M %p").lstrip("0")
+
+
 def slates():
     """Open classic and showdown slates, soonest first.
 
@@ -49,7 +55,7 @@ def slates():
             "id": g.draft_group_id, "kind": kind, "games": g.games_count,
             "starts": starts, "contests": len(contests),
             "label": (f"{tag} — {g.games_count} games" if kind == "classic" else tag)
-                     + f" · {starts:%a %-I:%M %p} ET · {len(contests)} contests",
+                     + f" · {clock(starts, '%a ')} ET · {len(contests)} contests",
         })
     return sorted(out, key=lambda s: (s["starts"], -s["games"]))
 

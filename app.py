@@ -120,7 +120,7 @@ def lobby_slates():
 @st.cache_data(ttl=300, show_spinner="Loading players from DraftKings…")
 def lobby_salaries(draft_group_id, kind):
     """(salary-export CSV text, time fetched) for one slate."""
-    return dk_lobby.salaries_csv(draft_group_id, kind), time.strftime("%-I:%M %p")
+    return dk_lobby.salaries_csv(draft_group_id, kind), time.strftime("%I:%M %p").lstrip("0")
 
 
 st.set_page_config(page_title="DFS Lineup Optimizer", layout="wide")
