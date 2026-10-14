@@ -198,7 +198,7 @@ sim_on = False
 if sport == "NFL" and contest_mode != "Cash / single entry":
     st.sidebar.subheader("Simulation")
     sim_on = st.sidebar.toggle(
-        "Pick lineups by simulation",
+        "Pick lineups by simulation", value=True,
         help="Builds extra lineups, simulates the slate thousands of times with "
              "teammates' and opponents' scores correlated the way they are in real games, "
              "then keeps the set of lineups that most often finishes near the top. Stack, "
@@ -644,12 +644,26 @@ if dk_content is not None:
             # instead of ppg_projection, and DraftKings IDs to match on.
             is_twogun = {"Name", "Projection", "Median", "Ceiling", "Nuke"} <= set(cheat_cols)
             if is_twogun:
+                # A showdown board carries CPT columns; a main-slate board doesn't.
+                # The wrong one would mix ownership: a showdown file's "Ownership"
+                # is captain + flex for two teams, not a classic field's ownership.
+                file_is_showdown = bool({"CPT Salary", "CPT Ownership"} & set(cheat_cols))
+                if file_is_showdown != is_showdown:
+                    st.error(
+                        f"This is a TwoGunGPT **{'showdown' if file_is_showdown else 'main-slate'}** "
+                        f"file, but the site is set to **{site}**. Switch the site in the "
+                        "sidebar or upload the "
+                        f"{'showdown' if is_showdown else 'main-slate'} file — mixing them would "
+                        "use the wrong projections and ownership.")
+                    st.stop()
                 proj_label = st.segmented_control(
                     "Optimize on", ["Projection", "Median", "Ceiling", "Nuke"],
-                    default="Projection", required=True, key="twogun_target",
+                    default="Ceiling", required=True, key="twogun_target",
                     help="TwoGunGPT file detected. Projection is his average game, "
                          "Median his 50th percentile, Ceiling a top-20% game and Nuke "
-                         "a top-5% game. Ceiling or Nuke suits large-field GPPs.")
+                         "a top-5% game. Ceiling is the default: money-tested on Weeks 3-5 "
+                         "with the simulation on, Ceiling with an open flex beat every other "
+                         "setup in boosters and standard GPPs.")
                 cheat_df["ppg_projection"] = cheat_df[proj_label]
                 # "Out ..." -> O, "Questionable (assumed playing)" -> Q, so the
                 # existing ruled-out filter applies.
@@ -1397,7 +1411,11 @@ if dk_content is not None:
             if not has_game_info:
                 st.warning("QB stacks need the **Game Info** column — see section 3.")
             else:
-                st.session_state.setdefault("qs_rows", [])
+                # Default stack: QB + 2 of his WR/TEs + 1 bring-back. Tested for money
+                # (Week 3 and 5 main, booster and standard GPP payouts, 8 builds per
+                # shape): it beat no stack rule, QB+1, QB+2 and QB+1+1 everywhere.
+                st.session_state.setdefault("qs_rows", [
+                    {"qb_side": 3, "bring_back": 1, "share": None, "max_exp": None}])
                 st.session_state.setdefault("qs_nonce", 0)
                 qs_df = pd.DataFrame(
                     [{"QB side": r["qb_side"], "Bring-back": r["bring_back"],
@@ -1483,12 +1501,10 @@ if dk_content is not None:
                 "to let the optimizer choose — which tends to produce no WRs, because the "
                 "good ones are already in the three dedicated WR slots."
             )
-            # Default flex mix: RB 45%, WR 33%, TE 22% (the user's split).
-            st.session_state.setdefault("flex_rows", [
-                {"position": "RB", "share": 45.0},
-                {"position": "WR", "share": 33.0},
-                {"position": "TE", "share": 22.0},
-            ])
+            # Default: no flex mix — the optimizer picks the flex. Money-tested on
+            # Weeks 3-5 against a fixed RB 45 / WR 33 / TE 22 mix, the open flex won
+            # in boosters and standard GPPs (and with Ceiling, everywhere).
+            st.session_state.setdefault("flex_rows", [])
             st.session_state.setdefault("flex_nonce", 0)
             flex_df = pd.DataFrame(
                 [{"Position": r["position"], "Share %": r["share"]}
@@ -1596,15 +1612,17 @@ if dk_content is not None:
                 for b in batch_plan:
                     st.caption(f"→ {b['label']}: {b['weight']:.0%} → {b['count']} lineup"
                                f"{'s' if b['count'] != 1 else ''}")
-                if any(b["count"] < 1 for b in batch_plan):
-                    smallest = min(b["weight"] for b in batch_plan)
-                    needed = int(-(-1 // smallest)) if smallest else len(batch_plan)
-                    st.warning(
-                        f"**Number of lineups is {num_lineups}**, too few to split across "
-                        f"{len(batch_plan)} combinations — "
-                        f"{sum(1 for b in batch_plan if b['count'] < 1)} get 0 lineups. "
-                        f"Raise it to at least {max(needed, len(batch_plan))}."
-                    )
+                empty = [b["label"] for b in batch_plan if b["count"] < 1]
+                if empty:
+                    # Small shares (e.g. 5% QB + RB x 22% TE flex = 1.1%) round to
+                    # zero at normal lineup counts. That's expected, not a problem —
+                    # building more lineups than you'll enter just to fill them
+                    # would be worse.
+                    st.caption(
+                        f"At {num_lineups} lineups, {len(empty)} small combination"
+                        f"{'s' if len(empty) != 1 else ''} round to 0 lineups "
+                        f"({'; '.join(empty)}) — their shares are too small to fill a whole "
+                        "lineup at this count. The rest are built as normal.")
             elif len(qb_stack_specs) > 1:
                 needed = sum(r["qb_side"] + r["bring_back"] for r in qb_stack_specs)
                 if needed > roster_slots:

@@ -414,6 +414,13 @@ def build_field(players, own, n=5000, seed=None, iters=8):
 # nine 9%-owned players and ~4 for nine 25%-owned. One contest is a thin
 # base; refit as more standings files come in. Showdowns use it too for now.
 DUPE_SCALE, DUPE_POWER = 0.004138, 0.40
+# Large fields (over 14,000 entries) use a refit on four ~85-95k-entry contests
+# (Quarter Jukebox and Dime Package, Weeks 4 and 5). Fit on one week and tested
+# on the other, it beat the Week 3 curve 4 for 4 (e.g. predicted 3.6% of entries
+# duplicated vs 5.3% actual; the Week 3 curve said 11.1%), so it's proven there.
+# Smaller fields keep the Week 3 curve until more small contests are in.
+LARGE_FIELD_ENTRIES = 14_000
+LARGE_DUPE_SCALE, LARGE_DUPE_POWER = 0.1353, 0.65
 
 
 def expected_duplicates(lineup_own, entries):
@@ -424,7 +431,9 @@ def expected_duplicates(lineup_own, entries):
     """
     q = np.array([np.prod(np.clip(np.asarray(row, dtype=float), 0.01, 100) / 100)
                   for row in lineup_own])
-    return max(entries - 1, 0) * DUPE_SCALE * q ** DUPE_POWER
+    scale, power = ((LARGE_DUPE_SCALE, LARGE_DUPE_POWER) if entries > LARGE_FIELD_ENTRIES
+                    else (DUPE_SCALE, DUPE_POWER))
+    return max(entries - 1, 0) * scale * q ** power
 
 
 # ------------------------------------------------------------ showdown field
