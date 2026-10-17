@@ -61,6 +61,23 @@ def contest_tier(entries):
     return CONTEST_TIERS[-1][1:]
 
 
+def showdown_defaults(entries):
+    """(max exposure %, lineups built per lineup kept, target finish %) for a
+    showdown field. Money-tested in Oct 2026 on 7 real showdowns with DK payout
+    tables (237-entry booster, 5,945 and 59,453-entry Dime Packages, 28-entry
+    Quintuple Up): 100% exposure beat 50% by 37-150+ ROI points in multi-entry
+    fields; 40 per lineup beat 20 only in the mid-size Dime; a top-5% target
+    beat 0.5% only in the tiny Quintuple Up. Without a field size the old
+    defaults stand."""
+    if entries is None:
+        return 50, 20, 0.5
+    if entries <= 100:
+        return 50, 20, 5.0
+    if 3_000 < entries <= 14_000:
+        return 100, 40, 0.5
+    return 100, 20, 0.5
+
+
 def randomness_for_field(entries):
     name, dev, _ = contest_tier(entries)
     lower = {"Small": "up to 3,000", "Medium": "3,001-5,000", "Large": "5,001-14,000",
@@ -137,32 +154,6 @@ num_lineups = st.sidebar.number_input(
     "Number of lineups", min_value=1, max_value=150,
     value=20 if is_showdown else 100, step=5 if is_showdown else 10)
 
-st.sidebar.subheader("Exposure")
-global_max_exp = st.sidebar.slider(
-    "Global max exposure %", min_value=0, max_value=100, value=50, step=5,
-    help=("Measured on a 24-player showdown pool: 50% cuts lineup overlap at no cost "
-          "to projection, while tighter caps get expensive fast (35% costs ~3 points, "
-          "25% costs ~9)."
-          if is_showdown else
-          "Default cap for every player. 100% means no cap. Per-player values override "
-          "this. 50% costs nothing in projection here and stops one player carrying "
-          "most of your entries."),
-)
-min_unique = st.sidebar.number_input(
-    "Min unique players per lineup", min_value=0, max_value=5,
-    value=2 if is_showdown else 0, step=1,
-    help="0 is off. At 2, no two lineups may share more than roster-2 players — it "
-         "removes near-twin lineups that differ by a single name. On showdown this is "
-         "the main diversification lever, since exposure caps can't bind on a small "
-         "pool.",
-)
-
-strategy_label = st.sidebar.selectbox(
-    "Exposure strategy", ["Total", "After each lineup"],
-    help="Total: share of all lineups. After each lineup: share of lineups generated so far.",
-)
-strategy_map = {"Total": TotalExposureStrategy, "After each lineup": AfterEachExposureStrategy}
-
 st.sidebar.subheader("Contest")
 contest_mode = st.sidebar.radio(
     "Type", ["Tournament (GPP)", "Cash / single entry", "Custom randomness"],
@@ -209,35 +200,68 @@ if sport == "NFL" and contest_mode != "Cash / single entry":
             step=500, key="sim_field_entries",
             help="Picks large- or small-field ownership and sets how many duplicates "
                  "to expect.")
-    if sim_on:
-        sim_mult = st.sidebar.select_slider(
-            "Lineups to build and compare",
-            options=[2, 3, 5, 8, 10, 20, 30], value=20 if is_showdown else 30,
-            format_func=lambda m: f"{m * num_lineups:,}",
-            help="The optimizer builds this many lineups under all your rules, the sim "
-                 "plays the slate out thousands of times, and only your best "
-                 f"{num_lineups} are kept. A bigger pile gives the sim more to choose "
-                 "from, at the cost of a slower build. Tested on Week 5: on the main "
-                 "slate (20 and 40 lineups) 30 per lineup beat 5 on every build and "
-                 "measure, about 90 seconds for 40; on a 16-lineup showdown 20 per "
-                 "lineup with 50,000 sims was best and bigger piles slipped.")
-        st.sidebar.caption(
-            f"Build **{sim_mult * num_lineups:,}** → keep the best **{num_lineups}** "
-            f"(1 in {sim_mult}).")
-        sim_runs = st.sidebar.select_slider(
-            "Simulations", options=[1000, 2500, 5000, 10000, 50000],
-            value=50000 if is_showdown else 5000,
-            help="More sims separate genuine upside from lucky draws, which matters "
-                 "more the bigger the pile. On a showdown 50,000 adds only seconds; on a "
-                 "main slate it needs a lot of memory, so start at 5,000 there.")
-        sim_top = st.sidebar.select_slider(
-            "Target finish", options=[0.1, 0.5, 1.0, 2.0, 5.0], value=0.5,
-            format_func=lambda v: f"top {v:g}%",
-            help="Tested for money (Week 3 and 5 main, Super Booster and standard GPP "
-                 "payouts, 8 builds each): top 0.5% beat 1% in every contest and scenario. "
-                 "A lineup scores a hit in a sim when it lands in this top slice of all "
-                 "the lineups built. They're all optimized, so this is a much higher bar "
-                 "than the same slice of a real contest field.") / 100
+# Showdown defaults follow the field size; changing the field resets them.
+sd_exp, sd_mult, sd_top = showdown_defaults(field_entries)
+if sim_on:
+    sim_mult = st.sidebar.select_slider(
+        "Lineups to build and compare",
+        options=[2, 3, 5, 8, 10, 20, 30, 40, 60], value=sd_mult if is_showdown else 30,
+        format_func=lambda m: f"{m * num_lineups:,}",
+        help="The optimizer builds this many lineups under all your rules, the sim "
+             "plays the slate out thousands of times, and only your best "
+             f"{num_lineups} are kept. A bigger pile gives the sim more to choose "
+             "from, at the cost of a slower build. Main slate: 30 per lineup beat 5 "
+             "on every build and measure (Week 5, about 90 seconds for 40). "
+             "Showdown, money-tested on 7 games: 40 per lineup beat 20 in the "
+             "5,945-entry Dime Package, so fields of 3,001-14,000 default to 40; "
+             "in boosters and 50k+ Dimes more lineups didn't pay.")
+    st.sidebar.caption(
+        f"Build **{sim_mult * num_lineups:,}** → keep the best **{num_lineups}** "
+        f"(1 in {sim_mult}).")
+    sim_runs = st.sidebar.select_slider(
+        "Simulations", options=[1000, 2500, 5000, 10000, 50000],
+        value=50000 if is_showdown else 5000,
+        help="More sims separate genuine upside from lucky draws, which matters "
+             "more the bigger the pile. On a showdown 50,000 adds only seconds; on a "
+             "main slate it needs a lot of memory, so start at 5,000 there.")
+    sim_top = st.sidebar.select_slider(
+        "Target finish", options=[0.1, 0.5, 1.0, 2.0, 5.0],
+        value=sd_top if is_showdown else 0.5,
+        format_func=lambda v: f"top {v:g}%",
+        help="Tested for money (Week 3 and 5 main, Super Booster and standard GPP "
+             "payouts, 8 builds each): top 0.5% beat 1% in every contest and scenario. "
+             "On showdown, top 5% wins only in tiny fields (100 entries or fewer). "
+             "A lineup scores a hit in a sim when it lands in this top slice of all "
+             "the lineups built. They're all optimized, so this is a much higher bar "
+             "than the same slice of a real contest field.") / 100
+
+# After the contest settings, so the showdown default can follow the field size.
+st.sidebar.subheader("Exposure")
+global_max_exp = st.sidebar.slider(
+    "Global max exposure %", min_value=0, max_value=100,
+    value=sd_exp if is_showdown else 50, step=5,
+    help=("Set from the field size. Money-tested on 7 showdowns: with several "
+          "entries, 100% (no cap) beat 50% by a wide margin in boosters and Dime "
+          "Packages, and 80% lost; 50% stays only for tiny fields of 100 entries or "
+          "fewer."
+          if is_showdown else
+          "Default cap for every player. 100% means no cap. Per-player values override "
+          "this. 50% costs nothing in projection here and stops one player carrying "
+          "most of your entries."),
+)
+min_unique = st.sidebar.number_input(
+    "Min unique players per lineup", min_value=0, max_value=5,
+    value=2 if is_showdown else 0, step=1,
+    help="0 is off. At 2, no two lineups may share more than roster-2 players — it "
+         "removes near-twin lineups that differ by a single name. On showdown this is "
+         "the main diversification lever (1 and 3 both lost money in testing).",
+)
+
+strategy_label = st.sidebar.selectbox(
+    "Exposure strategy", ["Total", "After each lineup"],
+    help="Total: share of all lineups. After each lineup: share of lineups generated so far.",
+)
+strategy_map = {"Total": TotalExposureStrategy, "After each lineup": AfterEachExposureStrategy}
 
 site_map = {"DraftKings": Site.DRAFTKINGS,
             "DraftKings Showdown": Site.DRAFTKINGS_CAPTAIN_MODE}
