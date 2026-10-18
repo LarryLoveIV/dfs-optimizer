@@ -27,6 +27,12 @@ except Exception:
     dk_lobby = None
 
 try:
+    # Lineup checks and the chat assistant; optional like the lobby.
+    import agent
+except Exception:
+    agent = None
+
+try:
     # Same model, faster engine. Verified to produce identical lineups; if the
     # import fails the app just falls back to the library's default solver.
     from or_solver import ORToolsSat as FAST_SOLVER
@@ -138,6 +144,116 @@ def lobby_slates():
 def lobby_salaries(draft_group_id, kind):
     """(salary-export CSV text, time fetched) for one slate."""
     return dk_lobby.salaries_csv(draft_group_id, kind), time.strftime("%I:%M %p").lstrip("0")
+
+
+@st.cache_data(ttl=120, show_spinner="Checking injury news on DraftKings…")
+def live_status(ids, kind, draft_group_id):
+    """{draftable ID: DraftKings injury tag} for the built lineups' players."""
+    return dk_lobby.player_status(ids, kind, draft_group_id)
+
+
+def secret(name):
+    """A value from the environment or .streamlit/secrets.toml, else ""."""
+    if os.environ.get(name):
+        return os.environ[name]
+    try:
+        return st.secrets.get(name, "")
+    except Exception:          # no secrets file at all
+        return ""
+
+
+@st.fragment
+def lineup_assistant(results, merged_df, csv_text, is_showdown, target, excluded,
+                     roster_size, budget, draft_group_id):
+    """Checks every lineup, then answers questions about the build. A fragment,
+    so a question reruns only this section, not the player pool above."""
+    st.subheader("Lineup assistant")
+    build = results.get("built_at")
+    lineups = results["lineups"]
+    picks = lineups[lineups["Position"] != "TOTAL"]
+
+    live, live_err = None, None
+    with st.container(horizontal=True, vertical_alignment="center"):
+        if st.button("Recheck injuries", icon=":material/refresh:", key="assist_recheck",
+                     help="Statuses are cached for 2 minutes. Recheck near lock."):
+            live_status.clear()
+        if dk_lobby is None:
+            live_err = "the DraftKings lobby package isn't installed"
+        else:
+            try:
+                live = live_status(tuple(sorted(map(str, picks["ID"]))),
+                                   "showdown" if is_showdown else "classic", draft_group_id)
+                if not live:
+                    live, live_err = None, "no open DraftKings slate has these players"
+            except Exception as exc:
+                live_err = str(exc)
+        st.caption(f"Live DraftKings status checked {time.strftime('%I:%M %p').lstrip('0')}."
+                   if live else f"Live injury status unavailable ({live_err}).")
+
+    found = agent.checks(lineups, merged_df, results["exposure"], live, excluded,
+                         roster_size, budget)
+    if found.empty:
+        st.success("No problems found in these lineups.", icon=":material/check_circle:")
+    else:
+        fixes = int(found["Severity"].eq("Fix").sum())
+        (st.error if fixes else st.warning)(
+            f"{fixes} to fix, {len(found) - fixes} to watch.", icon=":material/warning:")
+        st.dataframe(found, hide_index=True, width="stretch")
+
+    provider = st.session_state.get("assist_provider", "Gemini")
+    model = st.session_state.get("assist_model") or agent.PROVIDERS[provider]["model"]
+    key = (st.session_state.get("assist_key") or secret("GEMINI_API_KEY")
+           if agent.PROVIDERS[provider]["needs_key"] else "")
+    if agent.PROVIDERS[provider]["needs_key"] and not key:
+        st.info("Add a free Gemini API key under **Lineup assistant** in the sidebar to "
+                "ask questions about these lineups.", icon=":material/key:")
+        return
+
+    # One conversation per build; a new build starts it over.
+    if st.session_state.get("assist_build") != build:
+        st.session_state.assist_build = build
+        st.session_state.assist_chat = []
+    chat = st.session_state.assist_chat
+
+    box = st.container(height=520 if chat else "content")
+    with box:
+        for m in chat:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
+    suggestions = ["Summarize these lineups", "Are there any mistakes?",
+                   "Is anyone not playing?", "Which lineups look strongest and why?"]
+    if not chat:
+        # The chip is cleared as it's sent, so a failed answer can't resend it.
+        def take_chip():
+            st.session_state.assist_pending = st.session_state.assist_try
+            st.session_state.assist_try = None
+        st.pills("Try", suggestions, key="assist_try", on_change=take_chip,
+                 label_visibility="collapsed")
+    prompt = (st.chat_input("Ask about these lineups", key="assist_input",
+                            submit_mode="disable")
+              or st.session_state.pop("assist_pending", None))
+    if not prompt:
+        return
+    chat.append({"role": "user", "content": prompt})
+    data = agent.context(results, merged_df, found, live is not None, csv_text,
+                         is_showdown, target)
+    messages = ([{"role": "system", "content": agent.SYSTEM + "\n\n" + data}]
+                + chat[-12:])
+    with box:
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        with st.chat_message("assistant"):
+            try:
+                reply = st.write_stream(agent.stream(provider, model, key, messages))
+            except Exception as exc:
+                reply = None
+                hint = (" Is Ollama running, with the model pulled?"
+                        if provider == "Ollama" else "")
+                st.error(f"The assistant couldn't answer: {exc}{hint}")
+    if reply:
+        chat.append({"role": "assistant", "content": reply})
+    else:
+        chat.pop()
 
 
 st.set_page_config(page_title="DFS Lineup Optimizer", layout="wide")
@@ -263,6 +379,24 @@ strategy_label = st.sidebar.selectbox(
 )
 strategy_map = {"Total": TotalExposureStrategy, "After each lineup": AfterEachExposureStrategy}
 
+if agent is not None:
+    with st.sidebar.expander("Lineup assistant", icon=":material/smart_toy:"):
+        assist_provider = st.segmented_control(
+            "Model", list(agent.PROVIDERS), default="Gemini", required=True,
+            key="assist_provider",
+            help="Gemini: Google's free API tier (a key from aistudio.google.com, "
+                 "limited requests per day). Ollama: a free model on this computer — "
+                 "install Ollama and run `ollama pull qwen3:14b` first.")
+        st.text_input("Model name", placeholder=agent.PROVIDERS[assist_provider]["model"],
+                      key="assist_model",
+                      help="Leave blank for the default. Change it if the provider "
+                           "retires the model.")
+        if agent.PROVIDERS[assist_provider]["needs_key"]:
+            st.text_input("Gemini API key", type="password", key="assist_key",
+                          placeholder="saved key in use" if secret("GEMINI_API_KEY") else "",
+                          help="Kept only for this session. To skip typing it, put "
+                               "GEMINI_API_KEY = \"...\" in ~/.streamlit/secrets.toml.")
+
 site_map = {"DraftKings": Site.DRAFTKINGS,
             "DraftKings Showdown": Site.DRAFTKINGS_CAPTAIN_MODE}
 sport_map = {"NFL": Sport.FOOTBALL, "NBA": Sport.BASKETBALL, "MLB": Sport.BASEBALL, "NHL": Sport.HOCKEY}
@@ -271,6 +405,7 @@ st.subheader("1. Upload Files")
 col1, col2 = st.columns(2)
 with col1:
     dk_content = None
+    lobby_group_id = None
     sources = (["DraftKings lobby", "Upload CSV"] if sport == "NFL" and dk_lobby
                else ["Upload CSV"])
     salary_source = st.segmented_control("Salaries", sources, default=sources[0],
@@ -306,6 +441,7 @@ with col1:
             main = next((i for i, lab in enumerate(labels) if lab.startswith("Main")), 0)
             pick = by_label[st.selectbox("Slate", labels, index=main,
                                          key=f"dk_slate_{kind}")]
+            lobby_group_id = pick["id"]
             try:
                 dk_content, fetched_at = lobby_salaries(pick["id"], kind)
             except Exception as exc:
@@ -2477,6 +2613,11 @@ if dk_content is not None:
                     st.caption("Which position was captained." if is_showdown
                                else "Which position actually filled the flex slot.")
                     st.dataframe(results["flex"], width="stretch", hide_index=True)
+
+            if agent is not None:
+                lineup_assistant(results, merged_df, content, is_showdown, proj_label,
+                                 set(excluded_names), len(optimizer.settings.positions),
+                                 optimizer.settings.budget, lobby_group_id)
 
     except Exception as e:
         st.error(f"Error processing file: {e}")

@@ -92,3 +92,28 @@ def salaries_csv(draft_group_id, kind):
     rows.sort(key=lambda r: (r[4] != "CPT", -r[5]))
     w.writerows(rows)
     return buf.getvalue()
+
+
+def player_status(ids, kind, draft_group_id=None):
+    """DraftKings' live injury tag for each draftable ID: {"123": "OUT", ...}.
+
+    Tags are "None" (healthy), "Q", "D", "OUT", "IR" and the like. A salary file
+    uploaded by hand has no draft group, so every open slate of the same kind is
+    tried and the one sharing the most IDs wins. Read straight from the endpoint
+    because the client drops the field.
+    """
+    import requests
+    ids = {str(i) for i in ids}
+    groups = ([draft_group_id] if draft_group_id
+              else [s["id"] for s in slates() if s["kind"] == kind])
+    best = {}
+    for gid in groups:
+        url = f"https://api.draftkings.com/draftgroups/v1/draftgroups/{gid}/draftables"
+        pool = requests.get(url, timeout=15).json().get("draftables", [])
+        found = {str(p["draftableId"]): p.get("status") or "None"
+                 for p in pool if str(p["draftableId"]) in ids}
+        if len(found) > len(best):
+            best = found
+        if len(best) == len(ids):
+            break
+    return best

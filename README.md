@@ -65,6 +65,13 @@ across 20 lineups.
 - **Flex mix** — allocate the flex slot across positions by percentage
 - **Contest settings** — field size drives projection randomness; global exposure cap; minimum unique players
 - **Export** — DraftKings upload CSV with player IDs
+- **Lineup assistant** — after a build, checks every lineup (live DraftKings OUT/IR/Q
+  tags, duplicates, excluded players, missing projections, salary, exposure caps)
+  and answers questions about the set through a free chat model:
+  - *Gemini*: get a free key at aistudio.google.com and put `GEMINI_API_KEY = "..."`
+    in `~/.streamlit/secrets.toml` (or paste it in the sidebar each session).
+  - *Ollama*: install from ollama.com, run `ollama pull qwen3:14b`, pick Ollama in
+    the sidebar. Runs on your computer, no key, no limits.
 
 ## Solver
 
