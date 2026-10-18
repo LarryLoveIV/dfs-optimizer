@@ -605,9 +605,6 @@ def load_optimizer(csv_text, solver=None):
 
 if dk_content is not None:
     content = dk_content
-    if salary_source == "DraftKings lobby" and cheatsheet_file is None:
-        st.info("The DraftKings lobby doesn't include average points, so add a "
-                "projections file — without one every player projects 0.")
 
     try:
         optimizer = load_optimizer(content)
@@ -1226,11 +1223,12 @@ if dk_content is not None:
 
             st.markdown("**Captain mix**")
             st.caption(
-                "Share of lineups captained by each position. The captain is worth 1.5x, "
-                "so it is the biggest single decision on a showdown slate. Leave the table "
-                "empty to let projections choose — which tends to settle on a handful of "
-                "captains. Across 163 studied winning showdown slates the top-1% captains "
-                "were roughly WR 33%, RB 28%, QB 21%."
+                "Minimum share of lineups captained by each position. The captain is worth "
+                "1.5x, so it is the biggest single decision on a showdown slate. Shares under "
+                "100% leave the rest open for the optimizer to choose (so QB 60% means at "
+                "least 60% QB captains). Leave the table empty to let projections choose — "
+                "which tends to settle on a handful of captains. Across 163 studied winning "
+                "showdown slates the top-1% captains were roughly WR 33%, RB 28%, QB 21%."
             )
             cpt_positions = sorted(
                 {r["Position"] for _, r in merged_df.iterrows() if r["Position"] != "?"},
@@ -1269,18 +1267,25 @@ if dk_content is not None:
 
             if cpt_rows:
                 ctot = sum(r["share"] for r in cpt_rows)
-                if abs(ctot - 100) > 0.5:
-                    st.warning(f"Captain shares add up to {ctot:.0f}%, not 100% — "
-                               "they'll be scaled proportionally.")
-                raw = [r["share"] / ctot * num_lineups for r in cpt_rows]
+                if ctot > 100.5:
+                    st.warning(f"Captain shares add up to {ctot:.0f}%, more than 100% — "
+                               "they'll be scaled down proportionally.")
+                # Under 100%, the remainder is an open batch where the optimizer picks
+                # the captain, so each share works as a minimum.
+                units = [(r["position"], r["share"]) for r in cpt_rows]
+                if ctot < 99.5:
+                    units.append((None, 100 - ctot))
+                utot = sum(w for _, w in units)
+                raw = [w / utot * num_lineups for _, w in units]
                 counts = [int(x) for x in raw]
                 for i in sorted(range(len(raw)), key=lambda j: raw[j] - counts[j],
                                 reverse=True)[:num_lineups - sum(counts)]:
                     counts[i] += 1
-                batch_plan = [{"specs": [], "flex": None, "captain": r["position"],
-                               "weight": r["share"] / ctot,
-                               "label": f"{r['position']} captain", "count": c}
-                              for r, c in zip(cpt_rows, counts)]
+                batch_plan = [{"specs": [], "flex": None, "captain": pos,
+                               "weight": w / utot,
+                               "label": f"{pos} captain" if pos else "open captain",
+                               "count": c}
+                              for (pos, w), c in zip(units, counts)]
                 for b in batch_plan:
                     st.caption(f"→ {b['label']}: {b['weight']:.0%} → {b['count']} lineup"
                                f"{'s' if b['count'] != 1 else ''}")
