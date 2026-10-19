@@ -2248,6 +2248,10 @@ if dk_content is not None:
                            for idx, b in enumerate(batch_plan) if b.get("keep")]
                 chosen, info = sim.select(scores, batches, names, top_q=sim_top, caps=caps,
                                           thresh=thresh, share=share)
+                # Listed best first: each lineup's own top-% rate, discounted for
+                # the duplicates that would split it. Same lineups, new order.
+                alone = info["rate"] * (1 if share is None else share)
+                chosen = sorted(chosen, key=lambda c: -alone[c])
 
                 # Graded on a fresh set of sims, against what the optimizer alone
                 # would have kept (each batch's first lineups). Grading on the sims
