@@ -222,13 +222,12 @@ def lineup_assistant(results, merged_df, csv_text, is_showdown, target, excluded
                 st.markdown(m["content"])
     suggestions = ["Summarize these lineups", "Are there any mistakes?",
                    "Is anyone not playing?", "Which lineups look strongest and why?"]
-    if not chat:
-        # The chip is cleared as it's sent, so a failed answer can't resend it.
-        def take_chip():
-            st.session_state.assist_pending = st.session_state.assist_try
-            st.session_state.assist_try = None
-        st.pills("Try", suggestions, key="assist_try", on_change=take_chip,
-                 label_visibility="collapsed")
+    # The chip is cleared as it's sent, so a failed answer can't resend it.
+    def take_chip():
+        st.session_state.assist_pending = st.session_state.assist_try
+        st.session_state.assist_try = None
+    st.pills("Try", suggestions, key="assist_try", on_change=take_chip,
+             label_visibility="collapsed")
     prompt = (st.chat_input("Ask about these lineups", key="assist_input",
                             submit_mode="disable")
               or st.session_state.pop("assist_pending", None))
