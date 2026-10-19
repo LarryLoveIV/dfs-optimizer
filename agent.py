@@ -9,6 +9,7 @@ OpenAI-style chat endpoint, which both free options speak: Google's Gemini
 import csv
 import io
 import json
+import time
 
 import pandas as pd
 import requests
@@ -189,15 +190,25 @@ def stream(provider, model, key, messages):
     """Yield the model's reply as it arrives."""
     cfg = PROVIDERS[provider]
     headers = {"Authorization": f"Bearer {key}"} if key else {}
-    try:
-        r = requests.post(cfg["url"], headers=headers, stream=True, timeout=180,
-                          json={"model": model, "messages": messages, "stream": True})
-    except requests.ConnectionError:
-        raise RuntimeError(
-            "Ollama isn't running on this computer. Install it from ollama.com, open "
-            f"it, and run `ollama pull {model}` once." if provider == "Ollama"
-            else f"couldn't reach {provider} — check the internet connection.") from None
+    # Busy (503) and rate-limited (429) answers are usually brief: wait and retry.
+    for wait in (2, 5, 10, None):
+        try:
+            r = requests.post(cfg["url"], headers=headers, stream=True, timeout=180,
+                              json={"model": model, "messages": messages, "stream": True})
+        except requests.ConnectionError:
+            raise RuntimeError(
+                "Ollama isn't running on this computer. Install it from ollama.com, open "
+                f"it, and run `ollama pull {model}` once." if provider == "Ollama"
+                else f"couldn't reach {provider} — check the internet connection.") from None
+        if r.status_code not in (429, 503) or wait is None:
+            break
+        r.close()
+        time.sleep(wait)
     with r:
+        if r.status_code in (429, 503):
+            raise RuntimeError(f"{provider} is busy or rate-limiting {model} right now "
+                               "(tried 4 times). Wait a minute and ask again, or enter "
+                               "another model name in the sidebar.")
         if r.status_code == 404 and provider == "Ollama":
             raise RuntimeError(f"Ollama doesn't have {model} yet. Run "
                                f"`ollama pull {model}` in a terminal, then ask again.")
