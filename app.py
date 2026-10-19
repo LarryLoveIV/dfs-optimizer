@@ -247,9 +247,7 @@ def lineup_assistant(results, merged_df, csv_text, is_showdown, target, excluded
                 reply = st.write_stream(agent.stream(provider, model, key, messages))
             except Exception as exc:
                 reply = None
-                hint = (" Is Ollama running, with the model pulled?"
-                        if provider == "Ollama" else "")
-                st.error(f"The assistant couldn't answer: {exc}{hint}")
+                st.error(f"The assistant couldn't answer: {exc}")
     if reply:
         chat.append({"role": "assistant", "content": reply})
     else:

@@ -189,8 +189,18 @@ def stream(provider, model, key, messages):
     """Yield the model's reply as it arrives."""
     cfg = PROVIDERS[provider]
     headers = {"Authorization": f"Bearer {key}"} if key else {}
-    with requests.post(cfg["url"], headers=headers, stream=True, timeout=180,
-                       json={"model": model, "messages": messages, "stream": True}) as r:
+    try:
+        r = requests.post(cfg["url"], headers=headers, stream=True, timeout=180,
+                          json={"model": model, "messages": messages, "stream": True})
+    except requests.ConnectionError:
+        raise RuntimeError(
+            "Ollama isn't running on this computer. Install it from ollama.com, open "
+            f"it, and run `ollama pull {model}` once." if provider == "Ollama"
+            else f"couldn't reach {provider} — check the internet connection.") from None
+    with r:
+        if r.status_code == 404 and provider == "Ollama":
+            raise RuntimeError(f"Ollama doesn't have {model} yet. Run "
+                               f"`ollama pull {model}` in a terminal, then ask again.")
         if r.status_code != 200:
             raise RuntimeError(f"{provider} answered {r.status_code}: {r.text[:300]}")
         for line in r.iter_lines(decode_unicode=True):
