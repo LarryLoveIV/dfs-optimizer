@@ -15,7 +15,7 @@ import requests
 
 PROVIDERS = {
     "Gemini": {"url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-               "model": "gemini-2.5-flash", "needs_key": True},
+               "model": "gemini-3.8-flash", "needs_key": True},
     "Ollama": {"url": "http://localhost:11434/v1/chat/completions",
                "model": "qwen3:14b", "needs_key": False},
 }
