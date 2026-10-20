@@ -439,21 +439,29 @@ def expected_duplicates(lineup_own, entries):
 # ------------------------------------------------------------ showdown field
 # One captain (1.5x points and salary) plus five flex from one game, both
 # teams required (a DraftKings rule). Drawn from TwoGunGPT's CPT and FLEX
-# ownership. The salary floor is a loose guess and the field gets no stacking
-# bias beyond what the ownership implies: the one showdown contest measured
-# so far (TNF Week 5) isn't enough to justify tuning either.
-SHOWDOWN_FLEX, SHOWDOWN_MIN_SALARY = 5, 46_000
+# ownership. Fitted on 8 real showdown contests (3 games, 237 to 59k entries),
+# each value tested on a game it wasn't fitted to:
+#   - real fields spend nearly the whole cap (median $49.6k, 94-98% at $48k+);
+#     a drawn lineup is kept with probability exp(-SALARY_PREF * unspent/$1k)
+#   - flex picks lean to the captain's team: weight x SHOWDOWN_CPT_TEAM_BOOST
+# Money test (Stage 5, 10 games, 2026-10-20): beat the old $46k floor in
+# booster, mid and large fields, simulated and on real contest results.
+SHOWDOWN_FLEX, SHOWDOWN_MIN_SALARY = 5, 0
+SHOWDOWN_SALARY_PREF, SHOWDOWN_CPT_TEAM_BOOST = 1.5, 1.3
 
 
 def _sample_showdown(cpt_w, flex_w, team, salary, n, rng):
     cpt = np.argmax(cpt_w + _gumbel(rng, (n, len(cpt_w))), axis=1)
-    keys = np.broadcast_to(flex_w, (n, len(flex_w))) + _gumbel(rng, (n, len(flex_w)))
+    keys = np.broadcast_to(flex_w, (n, len(flex_w))).copy()
+    keys += np.log(SHOWDOWN_CPT_TEAM_BOOST) * (team[None, :] == team[cpt][:, None])
+    keys += _gumbel(rng, (n, len(flex_w)))
     keys[np.arange(n), cpt] = -np.inf
     flex = np.argpartition(-keys, SHOWDOWN_FLEX - 1, axis=1)[:, :SHOWDOWN_FLEX]
     ok = np.isfinite(keys[np.arange(n)[:, None], flex]).all(axis=1) & np.isfinite(cpt_w[cpt])
     sal = 1.5 * salary[cpt] + salary[flex].sum(axis=1)
     both = (team[flex] != team[cpt][:, None]).any(axis=1)
     keep = ok & both & (sal <= SALARY_CAP) & (sal >= SHOWDOWN_MIN_SALARY)
+    keep &= rng.random(n) < np.exp(-SHOWDOWN_SALARY_PREF * (SALARY_CAP - sal) / 1000)
     return cpt[keep], flex[keep]
 
 
@@ -471,7 +479,7 @@ def build_showdown_field(players, cpt_own, flex_own, n=5000, seed=None, iters=8)
     wc = np.where(tc > 0, np.log(np.maximum(tc, 1e-9)), -np.inf)
     wf = np.where(tf > 0, np.log(np.maximum(tf, 1e-9)), -np.inf)
     for _ in range(iters):
-        c, f = _sample_showdown(wc, wf, team, salary, 4 * n, rng)
+        c, f = _sample_showdown(wc, wf, team, salary, 8 * n, rng)
         if not len(c):
             break
         ec = np.bincount(c, minlength=len(team)) / len(c)
@@ -481,7 +489,7 @@ def build_showdown_field(players, cpt_own, flex_own, n=5000, seed=None, iters=8)
         wf[okf] += 0.8 * np.log(tf[okf] / ef[okf])
     cs, fs, have = [], [], 0
     while have < n:
-        c, f = _sample_showdown(wc, wf, team, salary, 4 * n, rng)
+        c, f = _sample_showdown(wc, wf, team, salary, 8 * n, rng)
         if not len(c):
             break
         cs.append(c); fs.append(f); have += len(c)
