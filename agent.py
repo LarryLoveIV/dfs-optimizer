@@ -25,7 +25,9 @@ PROVIDERS = {
 QUESTIONABLE = {"Q"}
 NOT_PLAYING = {"O", "OUT", "IR", "D", "DOUBTFUL", "SUSP", "PUP", "NA", "NFI", "DND"}
 
-SYSTEM = """You review DraftKings NFL lineups built by the user's optimizer and \
+SYSTEM = """{format}
+
+You review DraftKings NFL lineups built by the user's optimizer and \
 simulator. Answer only from the build data below; if it doesn't cover something \
 (news, weather, a player not in the pool), say so instead of guessing.
 
@@ -37,10 +39,32 @@ projections-file status may be older.
 Terms: "Proj" is the number the optimizer maximized (often TwoGunGPT's Ceiling, \
 not a median). "Sim avg/90th/99th" are simulated scores. "Top rate" is how often \
 a lineup finished in the target top % of the simulated field. "Own" is projected \
-ownership. A stack is a QB with his own WR/TE; a bring-back is an opposing WR/TE.
+ownership. {terms}
 
 Be brief and concrete: name lineups by number and players by name, use short \
 bullet lists, and lead with anything that needs fixing before lock."""
+
+# The format leads the prompt: with it buried in the data, models fell back to
+# main-slate thinking (QB stacks, bring-backs) on showdown builds.
+CLASSIC = ("FORMAT: CLASSIC main slate. Each lineup is 9 players from many games: "
+           "QB, 2 RB, 3 WR, TE, FLEX (RB/WR/TE) and DST, under a $50,000 cap.",
+           "A stack is a QB with his own WR/TE; a bring-back is an opposing WR/TE.")
+SHOWDOWN = ("FORMAT: SHOWDOWN (Captain Mode), a SINGLE game. Each lineup is 6 players "
+            "from the two teams in that game: 1 CPT (captain) + 5 FLEX, under a $50,000 "
+            "cap, with both teams represented. The CPT scores 1.5x points and costs 1.5x "
+            "salary; the CPT rows below already show the 1.5x salary and projection. Any "
+            "position, including K and DST, can fill CPT or FLEX. This is not a main "
+            "slate: there are no RB/WR/TE/FLEX slots, and main-slate ideas like QB+2 "
+            "stacks, bring-backs or game diversity don't apply.",
+            "What matters in showdown: the captain choice (the biggest single decision), "
+            "the team split such as 4-2 or 5-1 toward the captain's team, captain "
+            "ownership (\"CPT own\") vs flex ownership (\"FLEX own\"), and salary use. \"split SF 4-2 WAS\" "
+            "means 4 players from SF and 2 from WAS.")
+
+
+def system(is_showdown):
+    fmt, terms = SHOWDOWN if is_showdown else CLASSIC
+    return SYSTEM.format(format=fmt, terms=terms)
 
 
 def opponents(csv_text):
@@ -136,6 +160,19 @@ def stack_label(grp, pos_of, opp):
     return label
 
 
+def showdown_label(grp, pos_of):
+    """'CPT Purdy (QB SF), split SF 4-2 WAS' for a showdown lineup."""
+    cpt = grp[grp["Position"] == "CPT"]
+    if cpt.empty:
+        return "no CPT"
+    c = cpt.iloc[0]
+    counts = grp["Team"].value_counts()
+    other = [t for t in counts.index if t != c["Team"]]
+    split = f"{c['Team']} {counts[c['Team']]}-{counts[other[0]] if other else 0}"
+    return (f"CPT {c['Name']} ({pos_of.get(c['Name'], '?')} {c['Team']}), split {split}"
+            + (f" {other[0]}" if other else ""))
+
+
 def context(results, merged, found, live_ok, csv_text, is_showdown, target):
     """The build as compact text for the model: summary, checks, every lineup."""
     lineups = results["lineups"]
@@ -144,6 +181,9 @@ def context(results, merged, found, live_ok, csv_text, is_showdown, target):
     exposure = results["exposure"]
     own = (dict(zip(exposure["Name"], exposure["Proj own %"]))
            if "Proj own %" in exposure.columns else {})
+    # Showdown boards split ownership by slot; show each player's share for his slot.
+    slot_own = {slot: dict(zip(merged["Name"], pd.to_numeric(merged[f"{slot} Ownership"], errors="coerce")))
+                for slot in ("CPT", "FLEX") if is_showdown and f"{slot} Ownership" in merged.columns}
     opp = opponents(csv_text)
     sim_rows = ({int(r["Lineup"]): r for _, r in results["sim"].iterrows()}
                 if results.get("sim") is not None else {})
@@ -161,6 +201,13 @@ def context(results, merged, found, live_ok, csv_text, is_showdown, target):
     parts += ([f"- Lineup {r.Lineup}: {r.Player + ' — ' if r.Player else ''}{r.Issue} "
                f"[{r.Severity}]" for r in found.itertuples()] or ["- none found"])
 
+    def player_own(p):
+        slot = "CPT" if p.Position == "CPT" else "FLEX"
+        val = slot_own.get(slot, {}).get(p.Name)
+        if pd.notna(val):
+            return f", {slot} own {val}%"
+        return f", own {own[p.Name]}%" if pd.notna(own.get(p.Name)) else ""
+
     parts.append("\nLINEUPS:")
     totals = lineups[lineups["Position"] == "TOTAL"].set_index("Lineup")
     for lid, grp in picks.groupby("Lineup", sort=True):
@@ -169,11 +216,13 @@ def context(results, merged, found, live_ok, csv_text, is_showdown, target):
         s = sim_rows.get(int(lid))
         if s is not None:
             head += "".join(f", {k.lower()} {s[k]}" for k in s.index if k != "Lineup")
-        if not is_showdown:
+        if is_showdown:
+            head += f", {showdown_label(grp, pos_of)}"
+            grp = grp.sort_values("Position", key=lambda s: s.ne("CPT"), kind="stable")
+        else:
             head += f", stack {stack_label(grp, pos_of, opp)}"
         players = [f"{p.Position} {p.Name} ({pos_of.get(p.Name, '?')} {p.Team}, "
-                   f"${int(p.Salary):,}, proj {p.AvgPoints}"
-                   + (f", own {own[p.Name]}%" if pd.notna(own.get(p.Name)) else "") + ")"
+                   f"${int(p.Salary):,}, proj {p.AvgPoints}" + player_own(p) + ")"
                    for p in grp.itertuples()]
         parts.append(head + "\n  " + "; ".join(players))
 

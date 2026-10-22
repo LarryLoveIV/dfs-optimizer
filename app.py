@@ -236,7 +236,7 @@ def lineup_assistant(results, merged_df, csv_text, is_showdown, target, excluded
     chat.append({"role": "user", "content": prompt})
     data = agent.context(results, merged_df, found, live is not None, csv_text,
                          is_showdown, target)
-    messages = ([{"role": "system", "content": agent.SYSTEM + "\n\n" + data}]
+    messages = ([{"role": "system", "content": agent.system(is_showdown) + "\n\n" + data}]
                 + chat[-12:])
     with box:
         with st.chat_message("user"):
