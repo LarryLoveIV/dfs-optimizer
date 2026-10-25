@@ -546,9 +546,17 @@ class PlayerComboRule(OptimizerRule):
         self.var_key = {}
         self.key_vars = defaultdict(list)
         caps = {}
+        # The library's MinExposureRule holds each min back and then forces the
+        # player into every remaining lineup once he owes that many. Mirror its
+        # counts so a combo that can't share a roster with him waits.
+        self.lib_min = {}
+        self.picks = Counter()
+        self.fits = getattr(optimizer, "combo_fits", None)
         for player, variable in players_dict.items():
             self.var_key[variable.name] = player.full_name
             self.key_vars[player.full_name].append(variable)
+            if player.min_exposure:
+                self.lib_min[player.full_name] = round(player.min_exposure * self.total)
             cap = (player.max_exposure if player.max_exposure is not None
                    else context.max_exposure)
             if cap is not None:
@@ -583,11 +591,19 @@ class PlayerComboRule(OptimizerRule):
         # roster (two QBs, too many RBs) would otherwise all be forced into the
         # same lineup — every combo is due on the first one — and fail the run.
         # The rest catch up on later lineups.
-        if due:
-            names = self.combos[max(due)[2]]["players"]
+        remaining = self.context.remaining_lineups
+        forced = {nm for nm, k in self.lib_min.items() if k - self.picks[nm] >= remaining}
+        for _, _, i in sorted(due, reverse=True):
+            names = self.combos[i]["players"]
+            # A combo that can't share a roster with the library's forced players
+            # (a second QB, a fourth RB) would make the lineup impossible.
+            if forced - set(names) and self.fits and not self.fits(
+                    list(dict.fromkeys(list(names) + sorted(forced)))):
+                continue
             # Showdown copies: at least one of each player's CPT/FLEX vars.
             for nm in names:
                 solver.add_constraint(self.key_vars[nm], None, SolverSign.GTE, 1)
+            break
 
     def slots_left(self, names):
         """Lineups the most-capped player can still join under a total cap.
@@ -611,6 +627,7 @@ class PlayerComboRule(OptimizerRule):
     def post_optimize(self, solved_variables):
         picked = {self.var_key[name] for name in solved_variables if name in self.var_key}
         self.caps.set_used(list(picked))
+        self.picks.update(picked)
         for i, combo in enumerate(self.combos):
             if set(combo["players"]) <= picked:
                 self.used[i] += 1
@@ -1974,6 +1991,7 @@ if dk_content is not None:
                     apply_batch_shares(opt, shares, count)
                 if combos:
                     opt.player_combos = combos
+                    opt.combo_fits = lambda names: combo_fits(names, flex)
                     opt.add_new_rule(PlayerComboRule)
                 if captain:
                     # Every player sits in the pool twice. Dropping the CPT copy
@@ -1992,7 +2010,7 @@ if dk_content is not None:
                 return opt
 
             def run_batch(specs, count, report=True, exclude=(), flex=None, captain=None,
-                          idx=None):
+                          idx=None, resumed=False, relax=False):
                 """Solve on the fast engine, fall back to the library default.
 
                 The fallback exists for the error message: PuLP names the
@@ -2003,6 +2021,10 @@ if dk_content is not None:
                 """
                 combos = combo_targets(exclude, count, idx)
                 shares = exposure_shares(exclude, count) if idx is not None else None
+                if relax:
+                    # Last resort for the tail of a batch: no forced mins or combos.
+                    combos = [{**c, "min_count": None} for c in combos]
+                    shares = {**shares, "min": {}}
 
                 def attempt(solver, report_):
                     opt = make_optimizer(specs, solver, report_, flex, captain, combos,
@@ -2023,13 +2045,33 @@ if dk_content is not None:
                                 if all(pl.id in have for pl in lu.players)]
                         if keep:
                             kwargs["exclude_lineups"] = keep
-                    return list(opt.optimize(count, **kwargs))
+                    for lineup in opt.optimize(count, **kwargs):
+                        built.append(lineup)
+                    return built
 
+                built = []
                 if FAST_SOLVER is not None:
                     try:
                         return attempt(FAST_SOLVER, report)
                     except LineupOptimizerException:
-                        pass
+                        # A late dead end (mins and combos all due at once) used
+                        # to restart the whole batch on the slow solver. Keep what
+                        # was built and solve the rest as a fresh run: its targets
+                        # pick up from the lineups so far.
+                        if built and idx is not None:
+                            done = list(built)
+                            return done + run_batch(specs, count - len(done), False,
+                                                    list(exclude) + done, flex, captain, idx,
+                                                    resumed=True, relax=relax)
+                        if resumed and not relax:
+                            # The rest can't meet every min and combo at once. Build
+                            # them without forcing; the sim's picks top the mins up.
+                            st.warning(f"The last {count} lineups of this batch couldn't meet "
+                                       "every min exposure and combo at once, so they were "
+                                       "built without forcing them.")
+                            return run_batch(specs, count, False, exclude, flex, captain, idx,
+                                             resumed=True, relax=True)
+                built = []
                 return attempt(None, report)
 
             def exposure_shares(prior, count):
