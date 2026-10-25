@@ -1669,14 +1669,16 @@ if dk_content is not None:
 
             st.markdown("**Flex mix**")
             st.caption(
-                "Share of lineups whose flex slot holds each position. Leave the table empty "
-                "to let the optimizer choose — which tends to produce no WRs, because the "
-                "good ones are already in the three dedicated WR slots."
+                "Share of lineups whose flex slot holds each position. **Any** lets the "
+                "optimizer choose (the default, Any 100%) — which tends to produce no WRs, "
+                "because the good ones are already in the three dedicated WR slots. Mix Any "
+                "with a position, e.g. Any 85 / WR 15, to force that share and leave the rest open."
             )
             # Default: no flex mix — the optimizer picks the flex. Money-tested on
             # Weeks 3-5 against a fixed RB 45 / WR 33 / TE 22 mix, the open flex won
-            # in boosters and standard GPPs (and with Ceiling, everywhere).
-            st.session_state.setdefault("flex_rows", [])
+            # in boosters and standard GPPs (and with Ceiling, everywhere). Shown as
+            # Any 100%, which builds the same as an empty table.
+            st.session_state.setdefault("flex_rows", [{"position": "Any", "share": 100.0}])
             st.session_state.setdefault("flex_nonce", 0)
             flex_df = pd.DataFrame(
                 [{"Position": r["position"], "Share %": r["share"]}
@@ -1690,8 +1692,7 @@ if dk_content is not None:
                 hide_index=True,
                 column_config={
                     "Position": st.column_config.SelectboxColumn(
-                        "Position", options=[p for p in flex_options if p != "Any"],
-                        required=True),
+                        "Position", options=flex_options, required=True),
                     "Share %": st.column_config.NumberColumn(
                         "Share %", min_value=1, max_value=100, step=5, required=True),
                 },
@@ -1733,7 +1734,9 @@ if dk_content is not None:
             # Batches are the cross product of the two mixes. Either can be empty:
             # with neither, this collapses to a single run of everything.
             qb_units = [(r, r["share"]) for r in mix_rows] or [(None, 100.0)]
-            flex_units = [(r["position"], r["share"]) for r in flex_rows] or [(None, 100.0)]
+            # "Any" leaves the flex open, the same as no flex rule.
+            flex_units = ([(None if r["position"] == "Any" else r["position"], r["share"])
+                           for r in flex_rows] or [(None, 100.0)])
             qsum = sum(w for _, w in qb_units)
             fsum = sum(w for _, w in flex_units)
 
