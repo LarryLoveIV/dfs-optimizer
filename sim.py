@@ -199,7 +199,8 @@ def score_lineups(members, sims):
     return m @ sims
 
 
-def select(scores, batches, names, top_q=0.01, caps=None, thresh=None, share=None):
+def select(scores, batches, names, top_q=0.01, caps=None, thresh=None, share=None,
+           mins=None):
     """Choose lineups that together finish near the top most often.
 
     A sim "hits" for a lineup when it scores at least `thresh` in that sim —
@@ -219,6 +220,7 @@ def select(scores, batches, names, top_q=0.01, caps=None, thresh=None, share=Non
     lineups). Greedy picking can corner itself — the early picks use up the
     top players' allowance and every candidate left holds one of them — so
     any overage is repaired afterwards by swapping lineups (see _repair).
+    `mins` (name -> min lineups) is met the same way afterwards (see _fill_mins).
     """
     caps = caps or {}
     if thresh is None:
@@ -259,11 +261,17 @@ def select(scores, batches, names, top_q=0.01, caps=None, thresh=None, share=Non
             best = np.maximum(best, value[pick])
             for n in names[pick]:
                 used[n] = used.get(n, 0) + 1
-    over = {}
+    over, under = {}, {}
     if caps:
         chosen, over = _repair(chosen, value, names, caps, batches)
+    if mins:
+        chosen, under = _fill_mins(chosen, value, names, caps, mins, batches)
+        if caps:
+            over = {n: k for n, k in Counter(n for c in chosen for n in names[c]).items()
+                    if k > caps.get(n, 1e9)}
     return chosen, {"rate": rate, "hits": hits,
-                    "covered": hits[chosen].any(axis=0).mean(), "over_cap": over}
+                    "covered": hits[chosen].any(axis=0).mean(), "over_cap": over,
+                    "under_min": under}
 
 
 def _repair(chosen, value, names, caps, batches):
@@ -310,6 +318,54 @@ def _repair(chosen, value, names, caps, batches):
         count.subtract(names[out])
         count.update(names[cand])
     return chosen, {n: k for n, k in count.items() if k > caps.get(n, 1e9)}
+
+
+def _fill_mins(chosen, value, names, caps, mins, batches):
+    """Swap in lineups until every player with a min reaches it.
+
+    Each step swaps one chosen lineup for an unused candidate from the same
+    batch that holds a player still under his min, without dropping anyone
+    else below theirs or putting anyone over a cap, picking the swap that keeps
+    the set worth the most. Returns the picks and whoever is still short,
+    {name: lineups}, if the candidates can't supply him.
+    """
+    caps = caps or {}
+    batch_of = {c: b for b, (cands, _) in enumerate(batches) for c in cands}
+    chosen = list(chosen)
+    count = Counter(n for c in chosen for n in names[c])
+    for _ in range(4 * len(chosen)):
+        short = {n for n, k in mins.items() if count[n] < k}
+        if not short:
+            break
+        v = value[chosen]
+        top = np.argmax(v, axis=0)
+        first = v[top, np.arange(v.shape[1])]
+        v2 = v.copy()
+        v2[top, np.arange(v.shape[1])] = -1
+        second = np.maximum(v2.max(axis=0), 0) if len(chosen) > 1 else np.zeros_like(first)
+        taken = set(chosen)
+        pick, pick_val = None, -1.0
+        for slot, out in enumerate(chosen):
+            if names[out] & short:
+                continue
+            base = np.where(top == slot, second, first)
+            for cand in batches[batch_of[out]][0]:
+                if cand in taken or not names[cand] & short:
+                    continue
+                gone, new = names[out] - names[cand], names[cand] - names[out]
+                if any(count[n] - 1 < mins.get(n, 0) for n in gone) or any(
+                        count[n] + 1 > caps.get(n, 1e9) for n in new):
+                    continue
+                val = np.maximum(base, value[cand]).mean()
+                if val > pick_val:
+                    pick, pick_val = (slot, out, cand), val
+        if pick is None:
+            break
+        slot, out, cand = pick
+        chosen[slot] = cand
+        count.subtract(names[out])
+        count.update(names[cand])
+    return chosen, {n: count[n] for n, k in mins.items() if count[n] < k}
 
 
 def coverage(scores, picks, top_q=0.01, thresh=None):

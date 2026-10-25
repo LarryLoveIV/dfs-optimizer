@@ -2254,10 +2254,14 @@ if dk_content is not None:
                     pct = max_exp.get(nm, global_max_exp if global_max_exp < 100 else None)
                     if pct is not None and nm not in locked_names:
                         caps[nm] = -(-(pct / 100 * num_lineups - 1e-9) // 1)
+                # Mins on the same rounding as the build's batch schedule, never above the cap.
+                mins = {nm: min(int(pct / 100 * num_lineups + 0.5), caps.get(nm, num_lineups))
+                        for nm, pct in min_exp.items()
+                        if pct and nm not in locked_names and nm in set(merged_df["Name"])}
                 batches = [([i for i, bi in enumerate(batch_of) if bi == idx], b["keep"])
                            for idx, b in enumerate(batch_plan) if b.get("keep")]
                 chosen, info = sim.select(scores, batches, names, top_q=sim_top, caps=caps,
-                                          thresh=thresh, share=share)
+                                          thresh=thresh, share=share, mins=mins)
                 # Listed best first: each lineup's own top-% rate, discounted for
                 # the duplicates that would split it. Same lineups, new order.
                 alone = info["rate"] * (1 if share is None else share)
@@ -2277,6 +2281,7 @@ if dk_content is not None:
                     "covered": sim.coverage(fresh, chosen, sim_top, fresh_thresh),
                     "baseline": sim.coverage(fresh, base, sim_top, fresh_thresh),
                     "over_cap": info["over_cap"],
+                    "under_min": {n: (k, mins[n]) for n, k in info["under_min"].items()},
                     "field": ({"lineups": len(field_members), "entries": field_entries,
                                "error": field_err,
                                "which": ("TwoGunGPT's CPT/FLEX ownership" if is_showdown
@@ -2501,6 +2506,11 @@ if dk_content is not None:
                     st.warning(f"No set of the lineups built kept everyone under their exposure cap, "
                                f"so these players are over it (lineups shown): {over}. Loosen "
                                "their caps or build and compare more lineups.")
+                if note.get("under_min"):
+                    short = ", ".join(f"{n} ({k} of {need})" for n, (k, need) in note["under_min"].items())
+                    st.warning(f"Not enough of the lineups built hold these players to meet their "
+                               f"min exposure (lineups kept of lineups wanted): {short}. Build and "
+                               "compare more lineups, or check their caps and the stack rules.")
                 st.caption("Per lineup: its simulated average, 90th and 99th percentile "
                            "scores, and how often it lands in the target slice.")
                 st.dataframe(results["sim"], width="content", hide_index=True)
