@@ -531,7 +531,7 @@ class PlayerComboRule(OptimizerRule):
     Max: once the combo has been used max_count times, the players' variables
     may sum to at most k-1, i.e. never all of them again.
     Min: forcing is paced across the run rather than bunched at the start or
-    end, and skipped for any lineup where one of the players is at their own
+    end, one combo per lineup (the most overdue), and skipped for any lineup where one of the players is at their own
     max exposure — forcing then would make the lineup infeasible. Under "after
     each lineup" a capped player is blocked every other lineup, so the pacing
     catches up on the next open one. If a player is capped for good, the combo
@@ -565,6 +565,7 @@ class PlayerComboRule(OptimizerRule):
 
     def apply_for_iteration(self, solver, result):
         built = self.total - self.context.remaining_lineups
+        due = []
         for i, combo in enumerate(self.combos):
             names = combo["players"]
             if any(not self.key_vars.get(nm) for nm in names):
@@ -573,12 +574,20 @@ class PlayerComboRule(OptimizerRule):
             if max_count is not None and self.used[i] >= max_count:
                 variables = [v for nm in names for v in self.key_vars[nm]]
                 solver.add_constraint(variables, None, SolverSign.LTE, len(names) - 1)
-            elif (min_count and not any(self.caps.is_reached_exposure(nm) for nm in names)
-                  and (self.used[i] < -(-min_count * (built + 1) // self.total)
-                       or self.slots_left(names) <= min_count - self.used[i])):
-                # Showdown copies: at least one of each player's CPT/FLEX vars.
-                for nm in names:
-                    solver.add_constraint(self.key_vars[nm], None, SolverSign.GTE, 1)
+            elif min_count and not any(self.caps.is_reached_exposure(nm) for nm in names):
+                urgent = self.slots_left(names) <= min_count - self.used[i]
+                behind = -(-min_count * (built + 1) // self.total) - self.used[i]
+                if urgent or behind > 0:
+                    due.append((urgent, behind / min_count, i))
+        # Force one combo per lineup, the most overdue: combos that can't share a
+        # roster (two QBs, too many RBs) would otherwise all be forced into the
+        # same lineup — every combo is due on the first one — and fail the run.
+        # The rest catch up on later lineups.
+        if due:
+            names = self.combos[max(due)[2]]["players"]
+            # Showdown copies: at least one of each player's CPT/FLEX vars.
+            for nm in names:
+                solver.add_constraint(self.key_vars[nm], None, SolverSign.GTE, 1)
 
     def slots_left(self, names):
         """Lineups the most-capped player can still join under a total cap.
@@ -2261,6 +2270,10 @@ if dk_content is not None:
                 mins = {nm: min(int(pct / 100 * num_lineups + 0.5), caps.get(nm, num_lineups))
                         for nm, pct in min_exp.items()
                         if pct and nm not in locked_names and nm in set(merged_df["Name"])}
+                # Combos with a min: every player together, the same rounding.
+                for row in player_combos:
+                    if row.get("min"):
+                        mins[tuple(row["players"])] = int(row["min"] / 100 * num_lineups + 0.5)
                 batches = [([i for i, bi in enumerate(batch_of) if bi == idx], b["keep"])
                            for idx, b in enumerate(batch_plan) if b.get("keep")]
                 chosen, info = sim.select(scores, batches, names, top_q=sim_top, caps=caps,
@@ -2284,7 +2297,8 @@ if dk_content is not None:
                     "covered": sim.coverage(fresh, chosen, sim_top, fresh_thresh),
                     "baseline": sim.coverage(fresh, base, sim_top, fresh_thresh),
                     "over_cap": info["over_cap"],
-                    "under_min": {n: (k, mins[n]) for n, k in info["under_min"].items()},
+                    "under_min": {(" + ".join(n) if isinstance(n, tuple) else n): (k, mins[n])
+                                  for n, k in info["under_min"].items()},
                     "field": ({"lineups": len(field_members), "entries": field_entries,
                                "error": field_err,
                                "which": ("TwoGunGPT's CPT/FLEX ownership" if is_showdown
