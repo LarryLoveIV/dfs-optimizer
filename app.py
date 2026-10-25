@@ -1579,9 +1579,15 @@ if dk_content is not None:
                 st.session_state.setdefault("qs_rows", [
                     {"qb_side": 3, "bring_back": 1, "share": None, "max_exp": None}])
                 st.session_state.setdefault("qs_nonce", 0)
+                # Blanks are stored as None but shown as what they mean: a lone row
+                # gets 100% of lineups, and no cap is 100%. Collection maps them back,
+                # so the build is the same as with blank cells.
+                lone_row = len(st.session_state.qs_rows) == 1
                 qs_df = pd.DataFrame(
                     [{"QB side": r["qb_side"], "Bring-back": r["bring_back"],
-                      "Share %": r.get("share"), "Max Exp %": r["max_exp"]}
+                      "Share %": (r.get("share") if r.get("share") is not None
+                                  else 100.0 if lone_row else None),
+                      "Max Exp %": r["max_exp"] if r["max_exp"] is not None else 100.0}
                      for r in st.session_state.qs_rows],
                     columns=["QB side", "Bring-back", "Share %", "Max Exp %"])
                 qs_df["QB side"] = qs_df["QB side"].astype("Int64")
@@ -1606,7 +1612,7 @@ if dk_content is not None:
                                  "(summing to 100) to split the run between shapes."),
                         "Max Exp %": st.column_config.NumberColumn(
                             "Max Exp %", min_value=1, max_value=100, step=5,
-                            help="Blank = no cap. Caps how often any single game fills this "
+                            help="100 or blank = no cap. Caps how often any single game fills this "
                                  "shape — it does not reduce how often the row applies."),
                     },
                     key=f"qs_editor_{st.session_state.qs_nonce}",
@@ -1619,8 +1625,12 @@ if dk_content is not None:
                         "qb_side": int(row["QB side"]),
                         "bring_back": int(row["Bring-back"]) if pd.notna(row["Bring-back"]) else 0,
                         "share": float(row["Share %"]) if pd.notna(row["Share %"]) else None,
-                        "max_exp": float(row["Max Exp %"]) if pd.notna(row["Max Exp %"]) else None,
+                        "max_exp": (float(row["Max Exp %"])
+                                    if pd.notna(row["Max Exp %"]) and row["Max Exp %"] < 100
+                                    else None),
                     })
+                if len(collected_qs) == 1 and collected_qs[0]["share"] == 100:
+                    collected_qs[0]["share"] = None
                 if collected_qs != st.session_state.qs_rows:
                     st.session_state.qs_rows = collected_qs
                     st.session_state.qs_nonce += 1
