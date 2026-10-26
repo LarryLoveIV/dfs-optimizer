@@ -2057,11 +2057,13 @@ if dk_content is not None:
                         # A late dead end (mins and combos all due at once) used
                         # to restart the whole batch on the slow solver. Keep what
                         # was built and solve the rest as a fresh run: its targets
-                        # pick up from the lineups so far.
-                        if built and idx is not None:
+                        # pick up from the lineups so far. A single-batch build
+                        # resumes as batch 0 of its one-entry plan.
+                        if built:
                             done = list(built)
                             return done + run_batch(specs, count - len(done), False,
-                                                    list(exclude) + done, flex, captain, idx,
+                                                    list(exclude) + done, flex, captain,
+                                                    0 if idx is None else idx,
                                                     resumed=True, relax=relax)
                         if resumed and not relax:
                             # The rest can't meet every min and combo at once. Build
@@ -2247,7 +2249,7 @@ if dk_content is not None:
             else:
                 progress.write(f"solving {build_n} lineups…")
                 try:
-                    lineups = run_batch(qb_stack_specs, build_n)
+                    lineups = run_batch(qb_stack_specs, build_n, flex=batch_plan[0]["flex"])
                 except LineupOptimizerException as exc:
                     st.error(f"**Couldn't generate lineups:** {exc}\n\n" + trouble)
                     show_diagnostics()
