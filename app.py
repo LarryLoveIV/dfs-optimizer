@@ -1602,9 +1602,21 @@ if dk_content is not None:
                 # Default stack: QB + 2 of his WR/TEs + 1 bring-back. Tested for money
                 # (Week 3 and 5 main, booster and standard GPP payouts, 8 builds per
                 # shape): it beat no stack rule, QB+1, QB+2 and QB+1+1 everywhere.
-                st.session_state.setdefault("qs_rows", [
-                    {"qb_side": 3, "bring_back": 1, "share": None, "max_exp": None}])
+                # 2,000-3,000-entry fields add 20% QB+3+1 (Oct 2026, Weeks 3-7, 24
+                # builds per slate: sim +1.4 to +2.2 pts, real 2-3k contests +11.7;
+                # it leaned negative in big fields and is untested below 2,000).
+                # Changing the field size swaps the default unless the rows were edited.
+                std_rows = [{"qb_side": 3, "bring_back": 1, "share": None, "max_exp": None}]
+                qb3_rows = [{"qb_side": 3, "bring_back": 1, "share": 80.0, "max_exp": None},
+                            {"qb_side": 4, "bring_back": 1, "share": 20.0, "max_exp": None}]
+                default_rows = (qb3_rows if field_entries is not None
+                                and 2_000 <= field_entries <= 3_000 else std_rows)
+                st.session_state.setdefault("qs_rows", default_rows)
                 st.session_state.setdefault("qs_nonce", 0)
+                if (st.session_state.qs_rows != default_rows
+                        and st.session_state.qs_rows in (std_rows, qb3_rows)):
+                    st.session_state.qs_rows = default_rows
+                    st.session_state.qs_nonce += 1
                 # Blanks are stored as None but shown as what they mean: a lone row
                 # gets 100% of lineups, and no cap is 100%. Collection maps them back,
                 # so the build is the same as with blank cells.
