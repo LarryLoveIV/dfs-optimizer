@@ -1482,12 +1482,14 @@ if dk_content is not None:
                         "Positions on one team",
                         available_positions,
                         selection_mode="multi",
+                        default=[p for p in ("QB", "RB", "WR", "TE") if p in available_positions],
                         key="opp_first",
                     )
                     second_team_positions = st.pills(
                         "Positions to limit on the opposing team",
                         available_positions,
                         selection_mode="multi",
+                        default=[p for p in ("DST",) if p in available_positions],
                         key="opp_second",
                     )
                     max_allowed = st.number_input(
