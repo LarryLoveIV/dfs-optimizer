@@ -1476,7 +1476,7 @@ if dk_content is not None:
                     "(e.g. `NYJ@DET 09/27/2026 01:00PM ET`)."
                 )
             else:
-                restrict_opposing = st.toggle("Restrict positions for opposing team")
+                restrict_opposing = st.toggle("Restrict positions for opposing team", value=True)
                 if restrict_opposing:
                     first_team_positions = st.pills(
                         "Positions on one team",
