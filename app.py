@@ -464,6 +464,378 @@ with col2:
                         "DOWNLOAD, then drop the CSV in the box above.")
 
 
+def refit_note(raw_own):
+    """Say so when ownership was rescaled to fit the slate (see sim.fit_ownership)."""
+    total = float(np.nansum(raw_own))
+    if abs(total - 900) > sim.OWN_FIT_TOLERANCE * 900:
+        st.caption(f"This file's ownership adds up to {total:.0f}% on this slate instead of "
+                   "about 900%, so it's probably a board for another slate (e.g. the main "
+                   "board on an afternoon slate). It was rescaled to a full lineup per "
+                   "position for the simulated field and duplicates; treat those as rough.")
+
+
+def lineup_builder(merged_df, players, settings, is_showdown, field_default, top_default,
+                   results, data_key):
+    """Hand-pick one lineup, then simulate it against the projected field.
+
+    Uses the same sims, field and duplicate model as the build's lineup
+    picker, so its rates read like the Simulation table's. Reports the
+    lineup's score range, how often it finishes in the top slices of the
+    field (and wins, when the field is small enough to draw from), what each
+    player adds in its best games, and the single swaps that would help most.
+    """
+    slots = settings.positions
+    budget = settings.budget
+    mults = [1.5 if is_showdown and s.name == "CPT" else 1.0 for s in slots]
+    info = merged_df.set_index("Name")
+    names_all = list(info.index)
+
+    def eligible(slot):
+        if is_showdown:
+            return names_all
+        want = set(slot.positions)
+        return [n for n in names_all
+                if want & set(str(info.at[n, "Position"]).split("/"))]
+
+    def label(n):
+        r = info.loc[n]
+        proj = r.get("Projection", r.get("ppg_projection", r.get("AvgPoints")))
+        proj = f", {proj:.1f} pts" if pd.notna(proj) else ""
+        return f"{n} ({r['Position']} {r['Team']}, ${int(r['Salary']):,}{proj})"
+
+    keys = [f"lb_{i}" for i in range(len(slots))]
+    # A new slate can leave picks that are no longer in the pool.
+    for k, s in zip(keys, slots):
+        if st.session_state.get(k) not in (None, *eligible(s)):
+            st.session_state[k] = None
+
+    built = None
+    if results is not None:
+        built = results["lineups"]
+        built = built[built["Position"] != "TOTAL"]
+
+    def load(n):
+        rows = built[built["Lineup"] == n]
+        for k, nm in zip(keys, rows["Name"]):
+            st.session_state[k] = nm if nm in info.index else None
+        st.session_state.pop("lb_result", None)
+
+    def clear():
+        for k in keys:
+            st.session_state[k] = None
+        st.session_state.pop("lb_result", None)
+
+    st.caption("Pick a player for every roster spot, or start from one of your built "
+               "lineups, then simulate it. Uses the same simulation and opponent field "
+               "as **Pick lineups by simulation**.")
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        if built is not None and len(built):
+            n_built = int(built["Lineup"].max())
+            pick = st.selectbox("Start from built lineup", range(1, n_built + 1),
+                                key="lb_from", format_func=lambda n: f"Lineup {n}")
+            st.button("Load", icon=":material/download:", on_click=load, args=(pick,),
+                      key="lb_load")
+        st.button("Clear", icon=":material/close:", on_click=clear, key="lb_clear")
+
+    cols = st.columns(3)
+    for i, (k, s) in enumerate(zip(keys, slots)):
+        options = sorted(eligible(s), key=lambda n: -info.at[n, "Salary"])
+        with cols[i % 3]:
+            st.selectbox(s.name + (" (1.5x points and salary)" if mults[i] > 1 else ""),
+                         options, index=None, key=k, format_func=label,
+                         placeholder="Choose a player")
+
+    picked = [st.session_state.get(k) for k in keys]
+    chosen = [(i, n) for i, n in enumerate(picked) if n]
+    salary = sum(info.at[n, "Salary"] * mults[i] for i, n in chosen)
+    with st.container(horizontal=True):
+        st.metric("Players", f"{len(chosen)} of {len(slots)}", border=True, width="content")
+        st.metric("Salary used", f"${salary:,.0f}", border=True, width="content")
+        st.metric("Remaining", f"${budget - salary:,.0f}", border=True, width="content")
+
+    problems = []
+    names = [n for _, n in chosen]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        problems.append("Picked twice: " + ", ".join(dupes) + ".")
+    if salary > budget:
+        problems.append(f"Over the ${budget:,} salary cap by ${salary - budget:,.0f}.")
+    teams = {info.at[n, "Team"] for n in names}
+    if len(chosen) == len(slots) and len(teams) < 2:
+        problems.append("DraftKings needs players from both teams." if is_showdown
+                        else "DraftKings needs players from at least two games.")
+    for p in problems:
+        st.error(p)
+
+    has = lambda c: c in merged_df.columns and merged_df[c].notna().any()
+    field_on = has("CPT Ownership") and has("FLEX Ownership") if is_showdown else has("Ownership")
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        entries = st.number_input("Field size (entries)", min_value=2,
+                                  max_value=2_000_000, value=int(field_default or 5_000),
+                                  step=500, key="lb_entries",
+                                  help="Sets the ownership mix, duplicates and the win chance.")
+        runs = st.select_slider("Simulations", options=[5000, 10000, 20000], value=10000,
+                                key="lb_runs")
+        top = st.select_slider("Target finish", options=[0.1, 0.5, 1.0, 2.0, 5.0],
+                               value=top_default * 100, format_func=lambda v: f"top {v:g}%",
+                               key="lb_top") / 100
+    ready = len(chosen) == len(slots) and not problems
+    if not st.button("Simulate lineup", type="primary", icon=":material/play_arrow:",
+                     disabled=not ready, key="lb_go"):
+        res = st.session_state.get("lb_result")
+        if res is None or res["lineup"] != picked or res["setup"] != (entries, runs, top):
+            return
+    else:
+        # The sims and field are the slow part: reuse them while the slate and
+        # settings hold, so trying another lineup takes a moment.
+        base_key = (data_key, entries, runs, is_showdown)
+        base = st.session_state.get("lb_base")
+        if base is None or base["key"] != base_key:
+            with st.spinner(f"Simulating the slate {runs:,} times and the field…"):
+                pool_df = sim_pool(merged_df, players)
+                sims = sim.simulate(pool_df, runs, seed=7)
+                field_scores = lineup_own_of = None
+                if field_on:
+                    salaried = np.flatnonzero(pool_df["Salary"].notna().to_numpy())
+                    sub = pool_df.iloc[salaried].reset_index(drop=True)
+                    if is_showdown:
+                        cpt_own = pool_df["CPT Ownership"].fillna(0).to_numpy()
+                        flex_own = pool_df["FLEX Ownership"].fillna(0).to_numpy()
+                        f_cpt, f_flex, _ = sim.build_showdown_field(
+                            sub, sub["CPT Ownership"].to_numpy(),
+                            sub["FLEX Ownership"].to_numpy(), n=FIELD_LINEUPS, seed=7)
+                        fm = [[(salaried[c], 1.5)] + [(salaried[i], 1.0) for i in f]
+                              for c, f in zip(f_cpt, f_flex)]
+                        own = {"cpt": cpt_own, "flex": flex_own}
+                    else:
+                        raw_own = blend_ownership(pool_df, entries)
+                        own_arr = sim.fit_ownership(pool_df["Pos"], raw_own)
+                        refit_note(raw_own)
+                        field, _ = sim.build_field(sub, own_arr[salaried], n=FIELD_LINEUPS,
+                                                   seed=7)
+                        fm = [[(salaried[i], 1.0) for i in row] for row in field]
+                        own = {"cpt": own_arr, "flex": own_arr}
+                    if len(fm) < 100:
+                        st.warning(f"Couldn't simulate an opponent field from this file's "
+                                   f"ownership ({len(fm)} legal lineups), so only the "
+                                   "score range is shown.")
+                    else:
+                        field_scores = sim.score_lineups(fm, sims)
+                        lineup_own_of = own
+            base = {"key": base_key, "pool": pool_df, "sims": sims,
+                    "field": field_scores, "own": lineup_own_of}
+            st.session_state.lb_base = base
+        res = analyze_lineup(base, picked, mults, slots, info, entries, top, budget,
+                             is_showdown, eligible, built)
+        res["lineup"], res["setup"] = picked, (entries, runs, top)
+        st.session_state.lb_result = res
+
+    if res.get("missing"):
+        st.error("No simulation data for: " + ", ".join(res["missing"]) +
+                 " (no game info in the salary file).")
+        return
+    show_lineup_result(res, top, entries)
+
+
+def field_thresholds(base, qs):
+    """Per-sim score needed for each top-q slice of the field, cached on base."""
+    cache = base.setdefault("thresh", {})
+    for q in qs:
+        if q not in cache:
+            cache[q] = np.quantile(base["field"], 1 - q, axis=0)
+    return cache
+
+
+def lineup_stats(score, field, top, entries, thresh=None):
+    """The headline numbers for one lineup's sim scores."""
+    out = {"Sim avg": float(score.mean()),
+           "Sim median": float(np.median(score)),
+           "Sim 90th": float(np.quantile(score, 0.9)),
+           "Sim 99th": float(np.quantile(score, 0.99))}
+    if field is not None:
+        for q, name in ((top, f"Top {top:.1%}"), (0.01, "Top 1%"), (0.2, "Top 20%")):
+            out[name] = float((score >= thresh[q]).mean() * 100)
+        out["Median finish"] = float(np.median((field > score[None, :]).mean(axis=0)) * 100)
+        win = sim.win_rate(score, field, entries)
+        out["Win"] = None if win is None else float(win.mean() * 100)
+    return out
+
+
+def analyze_lineup(base, picked, mults, slots, info, entries, top, budget, is_showdown,
+                   eligible, built):
+    pool_df, sims, field = base["pool"], base["sims"], base["field"]
+    row_of = {n: i for i, n in enumerate(pool_df["Name"])}
+    missing = [n for n in picked if n not in row_of]
+    if missing:
+        return {"missing": missing}
+    rows = [row_of[n] for n in picked]
+    mult = np.array(mults)
+    score = (sims[rows] * mult[:, None]).sum(axis=0)
+    own = base["own"]
+
+    def own_of(i, m):
+        if own is None:
+            return np.nan
+        return float(own["cpt" if m > 1 else "flex"][i])
+
+    thr = field_thresholds(base, (top, 0.01, 0.2)) if field is not None else None
+    stats = lineup_stats(score, field, top, entries, thr)
+    lineup_own = [own_of(r, m) for r, m in zip(rows, mults)]
+    stats["Salary"] = float(sum(info.at[n, "Salary"] * m for n, m in zip(picked, mults)))
+    stats["Proj"] = float(sum(pool_df.at[r, "Proj"] * m for r, m in zip(rows, mults)))
+    if own is not None:
+        stats["Total own %"] = float(np.nansum(lineup_own))
+        stats["Exp. duplicates"] = float(sim.expected_duplicates([lineup_own], entries)[0])
+
+    # Each player's points in the lineup's target-hit sims against his average.
+    hit = None
+    if field is not None:
+        thresh = thr[top]
+        hit = score >= thresh
+    player_rows = []
+    for s, n, r, m in zip(slots, picked, rows, mults):
+        pts = sims[r] * m
+        row = {"Slot": s.name, "Player": n, "Pos": info.at[n, "Position"],
+               "Team": info.at[n, "Team"], "Salary": int(info.at[n, "Salary"] * m),
+               "Proj": round(float(pool_df.at[r, "Proj"] * m), 1),
+               "Own %": round(own_of(r, m), 1), "Sim avg": round(float(pts.mean()), 1)}
+        if hit is not None and hit.any():
+            row["Avg in hits"] = round(float(pts[hit].mean()), 1)
+            row["Share of hit pts %"] = round(float(pts[hit].sum() / score[hit].sum() * 100), 1)
+        player_rows.append(row)
+
+    # Built lineups to compare against, scored on the same sims.
+    compare = {}
+    if built is not None and len(built):
+        for lid, grp in built.groupby("Lineup", sort=True):
+            g_rows = [row_of.get(nm) for nm in grp["Name"]]
+            if None in g_rows:
+                continue
+            g_mult = [1.5 if p == "CPT" else 1.0 for p in grp["Position"]]
+            g_score = (sims[g_rows] * np.array(g_mult)[:, None]).sum(axis=0)
+            g = lineup_stats(g_score, field, top, entries, thr)
+            g["Salary"] = float(grp["Salary"].sum())
+            g["Proj"] = float(sum(pool_df.at[r, "Proj"] * m for r, m in zip(g_rows, g_mult)))
+            if own is not None:
+                g_own = [own_of(r, m) for r, m in zip(g_rows, g_mult)]
+                g["Total own %"] = float(np.nansum(g_own))
+                g["Exp. duplicates"] = float(sim.expected_duplicates([g_own], entries)[0])
+            compare[int(lid)] = g
+
+    # Every single-player swap that stays legal, scored on the target slice.
+    swaps = []
+    if hit is not None:
+        base_rate = hit.mean()
+        sal = {n: info.at[n, "Salary"] for n in info.index}
+        used_sal = sum(sal[n] * m for n, m in zip(picked, mults))
+        team_of = dict(zip(pool_df["Name"], pool_df["Team"]))
+        game_of = {n: "@".join(sorted((t, o))) for n, t, o in
+                   zip(pool_df["Name"], pool_df["Team"], pool_df["Opp"])}
+        for i, (s, cur, m) in enumerate(zip(slots, picked, mults)):
+            rest = [n for j, n in enumerate(picked) if j != i]
+            cands = [n for n in eligible(s) if n in row_of and n not in picked
+                     and used_sal - sal[cur] * m + sal[n] * m <= budget]
+            if is_showdown:
+                cands = [n for n in cands if len({team_of[x] for x in rest + [n]}) > 1]
+            else:
+                cands = [n for n in cands if len({game_of[x] for x in rest + [n]}) > 1]
+            if not cands:
+                continue
+            c_rows = [row_of[n] for n in cands]
+            new = score[None, :] + m * (sims[c_rows] - sims[row_of[cur]][None, :])
+            rates = (new >= thresh[None, :]).mean(axis=1)
+            for n, r_i, rate in zip(cands, c_rows, rates):
+                if rate > base_rate:
+                    swaps.append({
+                        "Slot": s.name, "Out": cur, "In": n,
+                        "Salary change": int((sal[n] - sal[cur]) * m),
+                        "Proj change": round(float((pool_df.at[r_i, "Proj"]
+                                                    - pool_df.at[row_of[cur], "Proj"]) * m), 1),
+                        "Own change": (round(own_of(r_i, m) - own_of(row_of[cur], m), 1)
+                                       if own is not None else None),
+                        f"Top {top:.1%} rate": round(float(rate * 100), 2),
+                        "Gain (pts)": round(float((rate - base_rate) * 100), 2),
+                    })
+        swaps.sort(key=lambda r: -r["Gain (pts)"])
+    return {"stats": stats, "players": pd.DataFrame(player_rows), "compare": compare,
+            "swaps": pd.DataFrame(swaps[:15]), "field_on": field is not None}
+
+
+def show_lineup_result(res, top, entries):
+    s = res["stats"]
+    st.markdown("**Simulated score**")
+    with st.container(horizontal=True):
+        st.metric("Projection", f"{s['Proj']:.1f}", border=True, width="content")
+        st.metric("Sim average", f"{s['Sim avg']:.1f}", border=True, width="content")
+        st.metric("Median", f"{s['Sim median']:.1f}", border=True, width="content")
+        st.metric("90th percentile", f"{s['Sim 90th']:.1f}", border=True, width="content",
+                  help="1 slate in 10 it scores this much or more.")
+        st.metric("99th percentile", f"{s['Sim 99th']:.1f}", border=True, width="content",
+                  help="1 slate in 100 it scores this much or more.")
+    if not res["field_on"]:
+        st.caption("No ownership in the projections file, so there's no simulated field "
+                   "to finish against — only the score range above.")
+    else:
+        st.markdown(f"**Against a simulated {entries:,}-entry field**")
+        with st.container(horizontal=True):
+            st.metric(f"Top {top:.1%}", f"{s[f'Top {top:.1%}']:.2f}%", border=True,
+                      width="content", help="Share of sims it scores in the field's "
+                                            "target slice — the number the lineup picker "
+                                            "maximizes.")
+            if top != 0.01:
+                st.metric("Top 1%", f"{s['Top 1%']:.2f}%", border=True, width="content")
+            st.metric("Top 20%", f"{s['Top 20%']:.1f}%", border=True, width="content",
+                      help="About where most GPPs' cash line sits. Check the contest's "
+                           "payout table for the exact line.")
+            st.metric("Win", "—" if s["Win"] is None else f"{s['Win']:.3f}%", border=True,
+                      width="content",
+                      help=("Chance it beats every other entry. Ties count as losses."
+                            if s["Win"] is not None else
+                            f"Only for fields up to {FIELD_LINEUPS + 1:,} entries — the "
+                            f"simulated field is {FIELD_LINEUPS:,} lineups, too few to "
+                            "draw a bigger contest from."))
+            st.metric("Median finish", f"top {max(s['Median finish'], 0.01):.1f}%",
+                      border=True, width="content",
+                      help="Its finish in a typical slate, as a share of the field "
+                           "above it.")
+            st.metric("Total ownership", f"{s['Total own %']:.0f}%", border=True,
+                      width="content")
+            st.metric("Expected duplicates", f"{s['Exp. duplicates']:.2f}", border=True,
+                      width="content",
+                      help="Copies other users are likely to enter. A win or top finish "
+                           "is split with each one; the rates above don't count that.")
+
+    st.markdown("**Players**")
+    st.caption("**Avg in hits** is the player's average in the sims where the lineup "
+               f"reaches the top {top:.1%}; **Share of hit pts** is his part of the "
+               "lineup's score in those sims.")
+    st.dataframe(res["players"], hide_index=True, width="stretch")
+
+    if res["compare"]:
+        st.markdown("**Compared with your built lineups**")
+        ids = list(res["compare"])
+        sel = st.multiselect("Built lineups", ids, default=ids[:3], key="lb_compare",
+                             format_func=lambda n: f"Lineup {n}")
+        order = ["Salary", "Proj", "Sim avg", "Sim 90th", "Sim 99th", f"Top {top:.1%}",
+                 "Top 1%", "Top 20%", "Win", "Median finish", "Total own %",
+                 "Exp. duplicates"]
+        table = pd.DataFrame([{"Lineup": "Yours", **s}]
+                             + [{"Lineup": f"Built {n}", **res["compare"][n]} for n in sel])
+        table = table[["Lineup"] + [c for c in order if c in table.columns]]
+        if top == 0.01:
+            table = table.drop(columns="Top 1%")
+        st.dataframe(table.round(2), hide_index=True, width="stretch")
+
+    if res["field_on"]:
+        st.markdown("**Best single swaps**")
+        if len(res["swaps"]):
+            st.caption(f"Each row changes one player, stays under the cap and is scored on "
+                       f"the same sims. Sorted by how much it raises the top {top:.1%} rate.")
+            st.dataframe(res["swaps"], hide_index=True, width="stretch")
+        else:
+            st.caption(f"No single swap raises the top {top:.1%} rate.")
+
+
 # Conventional roster order per sport, so pills read the way a lineup does
 # (team defense last for NFL). Anything not listed sorts alphabetically after.
 POSITION_ORDER = {
@@ -1482,7 +1854,7 @@ if dk_content is not None:
                         "Positions on one team",
                         available_positions,
                         selection_mode="multi",
-                        default=[p for p in ("QB", "RB", "WR", "TE") if p in available_positions],
+                        default=[p for p in ("QB",) if p in available_positions],
                         key="opp_first",
                     )
                     second_team_positions = st.pills(
@@ -2306,17 +2678,25 @@ if dk_content is not None:
                         # his FLEX share.
                         slot_own = lambda i, mult: cpt_own[i] if mult > 1 else flex_own[i]
                     else:
-                        pool_df["Own"] = blend_ownership(pool_df, field_entries)
-                        own_arr = pool_df["Own"].fillna(0).to_numpy()
+                        raw_own = blend_ownership(pool_df, field_entries)
+                        own_arr = sim.fit_ownership(pool_df["Pos"], raw_own)
+                        refit_note(raw_own)
+                        pool_df["Own"] = own_arr
                         field, field_err = sim.build_field(
-                            sub, pool_df["Own"].to_numpy()[salaried], n=FIELD_LINEUPS)
+                            sub, own_arr[salaried], n=FIELD_LINEUPS)
                         field_members = [[(salaried[i], 1.0) for i in row] for row in field]
                         slot_own = lambda i, mult: own_arr[i]
-                    thresh = np.quantile(sim.score_lineups(field_members, sims),
-                                         1 - sim_top, axis=0)
-                    lineup_own = [[slot_own(i, mult) for i, mult in m] for m in members]
-                    dupes = sim.expected_duplicates(lineup_own, field_entries)
-                    share = 1 / (1 + dupes)
+                    if len(field_members) < 100:
+                        st.warning(f"Couldn't simulate an opponent field from this file's "
+                                   f"ownership ({len(field_members)} legal lineups), so the "
+                                   "lineups are judged against each other instead.")
+                        field_on = False
+                    else:
+                        thresh = np.quantile(sim.score_lineups(field_members, sims),
+                                             1 - sim_top, axis=0)
+                        lineup_own = [[slot_own(i, mult) for i, mult in m] for m in members]
+                        dupes = sim.expected_duplicates(lineup_own, field_entries)
+                        share = 1 / (1 + dupes)
 
                 names = [{p.full_name for p in lu.players} for lu in lineups]
                 caps = {}
@@ -2714,6 +3094,12 @@ if dk_content is not None:
                 lineup_assistant(results, merged_df, content, is_showdown, proj_label,
                                  set(excluded_names), len(optimizer.settings.positions),
                                  optimizer.settings.budget, lobby_group_id)
+
+        if sport == "NFL" and cheatsheet_file is not None:
+            st.subheader(("5." if is_showdown else "7.") + " Lineup Builder")
+            lineup_builder(merged_df, players, optimizer.settings, is_showdown,
+                           field_entries, sim_top if sim_on else 0.005,
+                           st.session_state.get("results"), opt_key)
 
     except Exception as e:
         st.error(f"Error processing file: {e}")

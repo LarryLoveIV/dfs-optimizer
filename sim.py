@@ -436,6 +436,49 @@ def _sample_lineups(logw, pos, team, salary, n, rng, opp_of, boost=None):
     return lu[(sal <= SALARY_CAP) & (sal >= FIELD_MIN_SALARY) & np.isfinite(w[np.arange(n)[:, None], lu]).all(axis=1)]
 
 
+# Ownership has to add up to a lineup's worth of players (900% on DK classic)
+# for the field to match it. A board made for another slate doesn't: the
+# main-slate board on a 3-game afternoon slate gave its 6 QBs 17.5% between
+# them, and the reweighting drove the field outside the salary band until no
+# lineups were left. Totals within 10% of 900 (a board for this slate) are
+# left exactly as they are.
+OWN_FIT_TOLERANCE = 0.10
+FLEX_MINS = {"RB": 2, "WR": 3, "TE": 1}
+
+
+def fit_ownership(pos, own):
+    """Ownership (percent) rescaled so each position sums to its roster spots:
+    QB and DST to 100, RB/WR/TE to 700 between them, split by their own
+    shares but never below their required slots. Returned unchanged when the
+    total is already within OWN_FIT_TOLERANCE of 900."""
+    own = np.nan_to_num(np.asarray(own, dtype=float))
+    pos = np.asarray(pos, dtype=object)
+    full = 100.0 * sum(k for _, k in CLASSIC_SLOTS) + 100.0
+    if own.sum() <= 0 or abs(own.sum() - full) <= OWN_FIT_TOLERANCE * full:
+        return own
+    out = own.copy()
+    for p in ("QB", "DST"):
+        idx = pos == p
+        if out[idx].sum() > 0:
+            out[idx] *= 100.0 / out[idx].sum()
+    raw = {p: own[pos == p].sum() for p in FLEX_MINS}
+    fixed, left = {}, 100.0 * (sum(FLEX_MINS.values()) + 1)
+    while True:
+        free = [p for p in FLEX_MINS if p not in fixed and raw[p] > 0]
+        scale = left / sum(raw[p] for p in free) if free else 0
+        low = [p for p in free if raw[p] * scale < 100.0 * FLEX_MINS[p]]
+        if not low:
+            break
+        for p in low:
+            fixed[p] = 100.0 * FLEX_MINS[p]
+            left -= fixed[p]
+    for p in FLEX_MINS:
+        idx = pos == p
+        if raw[p] > 0:
+            out[idx] *= (fixed[p] / raw[p]) if p in fixed else scale
+    return np.clip(out, 0, 100)
+
+
 def build_field(players, own, n=5000, seed=None, iters=8):
     """Simulated opponent lineups whose player exposures match `own` (percent).
 
@@ -451,12 +494,20 @@ def build_field(players, own, n=5000, seed=None, iters=8):
     opp_of = dict(zip(team, players.Opp.astype(str)))
     target = np.clip(np.nan_to_num(np.asarray(own, dtype=float)) / 100, 0, 1)
     logw = np.where(target > 0, np.log(np.maximum(target, 1e-9)), -np.inf)
+    # Ownership the salary band can't produce (a board made for another slate)
+    # sends each round further outside the band. Once a round keeps under half
+    # the first round's lineups, its update is undone and fitting stops. Main
+    # slates never get close (their worst round keeps ~84%, Weeks 6-7).
+    first, prev = None, logw.copy()
     for _ in range(iters):
         lu = _sample_lineups(logw, pos, team, salary, 4 * n, rng, opp_of)
-        if not len(lu):
+        if not len(lu) or (first is not None and len(lu) < first / 2):
+            logw = prev
             break
+        first = first or len(lu)
         expo = np.bincount(lu.ravel(), minlength=len(pos)) / len(lu)
         ok = (target > 0) & (expo > 0)
+        prev = logw.copy()
         logw[ok] += 0.8 * np.log(target[ok] / expo[ok])
     field = np.empty((0, 9), dtype=int)
     while len(field) < n:
@@ -627,3 +678,24 @@ def optimal_rates(players, sims, n=500, showdown=False):
                 hits[i] += 1
                 cap_hits[i] += 1
     return hits / n * 100, (cap_hits / n * 100 if showdown else None)
+
+
+# ------------------------------------------------------------ one lineup
+def win_rate(score, field_scores, entries):
+    """Chance per sim that `score` beats every other entry in an `entries`-
+    entry contest whose opponents are drawn without replacement from the
+    simulated field (field_scores: (m, sims)). Needs entries <= m + 1; ties
+    count as losses. Returns an array of length sims, or None if the field
+    is too small to draw that many opponents from."""
+    m = field_scores.shape[0]
+    k = entries - 1
+    if k > m:
+        return None
+    below = (field_scores < score[None, :]).sum(axis=0)
+    lg = np.vectorize(math.lgamma)
+    # C(below, k) / C(m, k), in logs
+    out = np.zeros(len(score))
+    ok = below >= k
+    b = below[ok].astype(float)
+    out[ok] = np.exp(lg(b + 1) - lg(b - k + 1) - lg(m + 1) + lg(m - k + 1))
+    return out
