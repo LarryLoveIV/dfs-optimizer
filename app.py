@@ -758,7 +758,35 @@ def analyze_lineup(base, picked, mults, slots, info, entries, top, budget, is_sh
                     })
         swaps.sort(key=lambda r: -r["Gain (pts)"])
     return {"stats": stats, "players": pd.DataFrame(player_rows), "compare": compare,
-            "swaps": pd.DataFrame(swaps[:15]), "field_on": field is not None}
+            "swaps": pd.DataFrame(swaps[:15]), "field_on": field is not None,
+            "score": score,
+            "line": float(np.median(thr[top])) if field is not None else None}
+
+
+def score_histogram(score, line, top):
+    """Bars = share of sims per score bin; a rule at the typical target line."""
+    import altair as alt
+    counts, edges = np.histogram(score, bins=40)
+    df = pd.DataFrame({"lo": edges[:-1], "hi": edges[1:],
+                       "pct": counts / len(score) * 100})
+    df["range"] = [f"{a:.0f}–{b:.0f}" for a, b in zip(df["lo"], df["hi"])]
+    bars = alt.Chart(df).mark_bar(binSpacing=2, cornerRadiusTopLeft=4,
+                                  cornerRadiusTopRight=4).encode(
+        x=alt.X("lo:Q", bin="binned", title="Simulated score (DK points)"),
+        x2="hi:Q",
+        y=alt.Y("pct:Q", title="Share of sims (%)"),
+        tooltip=[alt.Tooltip("range:N", title="Score"),
+                 alt.Tooltip("pct:Q", title="Share of sims %", format=".1f")])
+    if line is None:
+        return bars
+    rule_df = pd.DataFrame({"x": [line], "label": [f"Typical top {top:.1%} line: {line:.0f}"]})
+    rule = alt.Chart(rule_df).mark_rule(strokeDash=[4, 3], strokeWidth=2,
+                                        color="gray").encode(
+        x="x:Q", tooltip=[alt.Tooltip("label:N", title="")])
+    text = alt.Chart(rule_df).mark_text(align="left", dx=6, dy=-6, baseline="bottom",
+                                        color="gray").encode(
+        x="x:Q", y=alt.value(0), text="label:N")
+    return bars + rule + text
 
 
 def show_lineup_result(res, top, entries):
@@ -772,6 +800,12 @@ def show_lineup_result(res, top, entries):
                   help="1 slate in 10 it scores this much or more.")
         st.metric("99th percentile", f"{s['Sim 99th']:.1f}", border=True, width="content",
                   help="1 slate in 100 it scores this much or more.")
+    if res.get("score") is not None:
+        st.altair_chart(score_histogram(res["score"], res.get("line"), top), width="stretch")
+        if res.get("line") is not None:
+            st.caption(f"The dashed line is the score a top-{top:.1%} finish needs in a "
+                       "typical sim; it moves from sim to sim, so the rate above is "
+                       "counted sim by sim, not from this line.")
     if not res["field_on"]:
         st.caption("No ownership in the projections file, so there's no simulated field "
                    "to finish against — only the score range above.")
