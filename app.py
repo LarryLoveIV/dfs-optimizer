@@ -59,6 +59,21 @@ CONTEST_TIERS = [
 ]
 
 
+VS_DST = "Lineups with a player facing their own DST"
+
+
+def lineup_faces_dst(lu):
+    """True when any non-DST player in the lineup plays against its DST."""
+    ps = list(lu.players)
+    dst = [p for p in ps if "DST" in p.positions]
+    gi = getattr(dst[0], "game_info", None) if dst else None
+    if gi is None:
+        return False
+    opp = gi.away_team if dst[0].team == gi.home_team else gi.home_team
+    return any(p.team == opp for p in ps if "DST" not in p.positions)
+
+
+
 def contest_tier(entries):
     """(name, randomness, small-field ownership share) for a contest size."""
     for limit, name, dev, small in CONTEST_TIERS:
@@ -1781,6 +1796,7 @@ if dk_content is not None:
                 "exposure, min-unique and randomness."
             )
             restrict_opposing = False
+            vs_dst_cap = None
             first_team_positions, second_team_positions, max_allowed = [], [], 0
             same_team_pairs = []
             cap_no_qb = cap_with_qb = roster_slots
@@ -1871,6 +1887,7 @@ if dk_content is not None:
             has_game_info = bool(optimizer.player_pool.games)
 
             restrict_opposing = False
+            vs_dst_cap = None
             first_team_positions = []
             second_team_positions = []
             max_allowed = 0
@@ -1888,7 +1905,7 @@ if dk_content is not None:
                         "Positions on one team",
                         available_positions,
                         selection_mode="multi",
-                        default=[p for p in ("QB",) if p in available_positions],
+                        default=[p for p in ("QB", "RB") if p in available_positions],
                         key="opp_first",
                     )
                     second_team_positions = st.pills(
@@ -1901,6 +1918,13 @@ if dk_content is not None:
                     max_allowed = st.number_input(
                         "Max allowed together", min_value=0, max_value=10, value=0, key="opp_max"
                     )
+                    vs_dst_cap = st.number_input(
+                        "Max lineups with a player facing their own DST (%)", min_value=0,
+                        max_value=100, value=3, step=1, key="opp_dst_cap",
+                        help="After the rule above, caps the share of lineups that still have any "
+                             "player facing the lineup's DST. Pros run about 3% (2.6% in 2026, 4.2% "
+                             "in 2024-25). 100 = no cap. Applied when the simulation picks the "
+                             "lineups.")
                     st.caption(
                         "When a lineup uses any of the first positions, at most this many players from "
                         "the second group on that player's opposing team may join them. `0` blocks the "
@@ -2733,11 +2757,18 @@ if dk_content is not None:
                         share = 1 / (1 + dupes)
 
                 names = [{p.full_name for p in lu.players} for lu in lineups]
+                cap_vs_dst = (vs_dst_cap is not None and vs_dst_cap < 100 and not is_showdown)
+                if cap_vs_dst:
+                    for nm_set, lu in zip(names, lineups):
+                        if lineup_faces_dst(lu):
+                            nm_set.add(VS_DST)
                 caps = {}
                 for nm in merged_df["Name"]:
                     pct = max_exp.get(nm, global_max_exp if global_max_exp < 100 else None)
                     if pct is not None and nm not in locked_names:
                         caps[nm] = -(-(pct / 100 * num_lineups - 1e-9) // 1)
+                if cap_vs_dst:
+                    caps[VS_DST] = int(vs_dst_cap / 100 * num_lineups + 0.5)
                 # Mins on the same rounding as the build's batch schedule, never above the cap.
                 mins = {nm: min(int(pct / 100 * num_lineups + 0.5), caps.get(nm, num_lineups))
                         for nm, pct in min_exp.items()
