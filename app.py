@@ -313,6 +313,15 @@ else:
 
 if contest_mode != "Tournament (GPP)":
     field_entries = None
+# Winner-take-all only pays first, so spreading players wider pays off there. Field
+# size can't tell it apart from a micro booster (also small, but pays the top 5-20).
+is_wta = False
+if not is_showdown and contest_mode != "Cash / single entry":
+    is_wta = st.sidebar.toggle(
+        "Winner-take-all contest", value=False, key="is_wta",
+        help="Only first place pays. Sets max exposure to 35% (each player in at most "
+             "about a third of your lineups). Money-tested on 475-entry $0.25 WTAs with "
+             "10 lineups, Weeks 3-8: 35% beat 50% in two separate runs and 25% lost.")
 sim_on = False
 if sport == "NFL" and contest_mode != "Cash / single entry":
     st.sidebar.subheader("Simulation")
@@ -367,7 +376,7 @@ if sim_on:
 st.sidebar.subheader("Exposure")
 global_max_exp = st.sidebar.slider(
     "Global max exposure %", min_value=0, max_value=100,
-    value=sd_exp if is_showdown else 50, step=5,
+    value=sd_exp if is_showdown else (35 if is_wta else 50), step=5,
     help=("Set from the field size. Money-tested on 7 showdowns: with several "
           "entries, 100% (no cap) beat 50% by a wide margin in boosters and Dime "
           "Packages, and 80% lost; 50% stays only for tiny fields of 100 entries or "
@@ -375,7 +384,7 @@ global_max_exp = st.sidebar.slider(
           if is_showdown else
           "Default cap for every player. 100% means no cap. Per-player values override "
           "this. 50% costs nothing in projection here and stops one player carrying "
-          "most of your entries."),
+          "most of your entries. Winner-take-all contests default to 35%."),
 )
 min_unique = st.sidebar.number_input(
     "Min unique players per lineup", min_value=0, max_value=5,
