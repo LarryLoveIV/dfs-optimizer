@@ -99,6 +99,14 @@ def showdown_defaults(entries):
     return 100, 20, 0.5
 
 
+def classic_exposure_default(is_wta, lineups):
+    """Max exposure % for a main slate. Winner-take-all gets 35% only with more than
+    3 lineups: money-tested with 10 lineups in 475-entry WTAs, where 35% beat 50%.
+    With 3 lineups in 118-entry WTAs it was even in the sim and worse in real
+    contests, so 50% stays (2026-11-06)."""
+    return 35 if is_wta and lineups > 3 else 50
+
+
 def randomness_for_field(entries):
     name, dev, _ = contest_tier(entries)
     lower = {"Small": "up to 3,000", "Medium": "3,001-5,000", "Large": "5,001-14,000",
@@ -284,11 +292,12 @@ num_lineups = st.sidebar.number_input(
 
 st.sidebar.subheader("Contest")
 contest_mode = st.sidebar.radio(
-    "Type", ["Tournament (GPP)", "Cash / single entry", "Custom randomness"],
-    help="Randomness is jitter added to each projection before every solve, so "
-         "lineups stop repeating. Bigger fields justify more of it.",
+    "Type", ["Tournament (GPP)", "Cash (double-up)", "Custom randomness"],
+    help="Single-entry tournaments belong under Tournament: set Number of lineups to 1. "
+         "Cash turns the simulation off. Randomness is jitter added to each projection "
+         "before every solve, so lineups stop repeating. Bigger fields justify more of it.",
 )
-if contest_mode == "Cash / single entry":
+if contest_mode == "Cash (double-up)":
     deviation = 0.0
     st.sidebar.caption("No jitter — you want the single best lineup, and every run "
                        "returns the same one.")
@@ -316,14 +325,15 @@ if contest_mode != "Tournament (GPP)":
 # Winner-take-all only pays first, so spreading players wider pays off there. Field
 # size can't tell it apart from a micro booster (also small, but pays the top 5-20).
 is_wta = False
-if not is_showdown and contest_mode != "Cash / single entry":
+if not is_showdown and contest_mode != "Cash (double-up)":
     is_wta = st.sidebar.toggle(
         "Winner-take-all contest", value=False, key="is_wta",
-        help="Only first place pays. Sets max exposure to 35% (each player in at most "
-             "about a third of your lineups). Money-tested on 475-entry $0.25 WTAs with "
-             "10 lineups, Weeks 3-8: 35% beat 50% in two separate runs and 25% lost.")
+        help="Turn on for any contest where only first place pays. Sets max exposure "
+             "from your number of lineups: 35% with more than 3 (money-tested on 475-entry "
+             "$0.25 WTAs with 10 lineups, Weeks 3-8: 35% beat 50% in two separate runs and "
+             "25% lost), 50% with 3 or fewer (118-entry WTAs: 35% added nothing).")
 sim_on = False
-if sport == "NFL" and contest_mode != "Cash / single entry":
+if sport == "NFL" and contest_mode != "Cash (double-up)":
     st.sidebar.subheader("Simulation")
     sim_on = st.sidebar.toggle(
         "Pick lineups by simulation", value=True,
@@ -376,7 +386,7 @@ if sim_on:
 st.sidebar.subheader("Exposure")
 global_max_exp = st.sidebar.slider(
     "Global max exposure %", min_value=0, max_value=100,
-    value=sd_exp if is_showdown else (35 if is_wta else 50), step=5,
+    value=sd_exp if is_showdown else classic_exposure_default(is_wta, num_lineups), step=5,
     help=("Set from the field size. Money-tested on 7 showdowns: with several "
           "entries, 100% (no cap) beat 50% by a wide margin in boosters and Dime "
           "Packages, and 80% lost; 50% stays only for tiny fields of 100 entries or "
@@ -384,7 +394,8 @@ global_max_exp = st.sidebar.slider(
           if is_showdown else
           "Default cap for every player. 100% means no cap. Per-player values override "
           "this. 50% costs nothing in projection here and stops one player carrying "
-          "most of your entries. Winner-take-all contests default to 35%."),
+          "most of your entries. Winner-take-all contests with more than 3 lineups "
+          "default to 35%."),
 )
 min_unique = st.sidebar.number_input(
     "Min unique players per lineup", min_value=0, max_value=5,
