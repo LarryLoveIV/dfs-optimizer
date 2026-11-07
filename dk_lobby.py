@@ -60,6 +60,34 @@ def slates():
     return sorted(out, key=lambda s: (s["starts"], -s["games"]))
 
 
+def contests(draft_group_id):
+    """The slate's open contests, one per distinct name, fee and size, cheapest first.
+
+    DraftKings runs many identical copies of a contest, and head-to-heads are left
+    out. Each: {"id", "name", "fee", "field", "is_cash"}.
+    """
+    details = Client().contests(sport=Sport.NFL)
+    out = {}
+    for c in details.contests:
+        if c.draft_group_id != draft_group_id or c.is_head_to_head:
+            continue
+        e = c.entries_details
+        out.setdefault((c.name, e.fee, e.maximum), {
+            "id": c.contest_id, "name": c.name, "fee": e.fee, "field": e.maximum,
+            "is_cash": bool(c.is_double_up or c.is_fifty_fifty)})
+    return sorted(out.values(), key=lambda c: (c["fee"], c["field"], c["name"]))
+
+
+def contest_rules(contest_id):
+    """What the lobby list doesn't carry: {"max_per_user", "winner_take_all"}.
+    Winner-take-all means only first place is paid."""
+    import requests
+    url = f"https://api.draftkings.com/contests/v1/contests/{contest_id}?format=json"
+    d = requests.get(url, timeout=15).json()["contestDetail"]
+    paid = max(p["maxPosition"] for p in d["payoutSummary"])
+    return {"max_per_user": int(d["maximumEntriesPerUser"]), "winner_take_all": paid == 1}
+
+
 def salaries_csv(draft_group_id, kind):
     """The slate's player pool as DraftKings salary-export CSV text."""
     pool = Client().draftables(draft_group_id=draft_group_id).players

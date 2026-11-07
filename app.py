@@ -170,6 +170,16 @@ def lobby_slates():
     return dk_lobby.slates()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def lobby_contests(draft_group_id):
+    return dk_lobby.contests(draft_group_id)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def lobby_contest_rules(contest_id):
+    return dk_lobby.contest_rules(contest_id)
+
+
 @st.cache_data(ttl=300, show_spinner="Loading players from DraftKings…")
 def lobby_salaries(draft_group_id, kind):
     """(salary-export CSV text, time fetched) for one slate."""
@@ -283,6 +293,35 @@ def lineup_assistant(results, merged_df, csv_text, is_showdown, target, excluded
         chat.pop()
 
 
+def contest_label(c):
+    fee = f"${c['fee']:,.2f}" if c["fee"] else "Free"
+    return f"{c['name']} · {fee} · {c['field']:,} entries"
+
+
+def apply_contest(pick_key, lineups_key):
+    """Fill the sidebar from the contest just picked. These are only starting values:
+    a hand edit stays until another contest is picked."""
+    contest = st.session_state[pick_key]
+    if contest is None:
+        st.session_state.contest_filled = None
+        return
+    st.session_state.contest_mode = "Cash (double-up)" if contest["is_cash"] else "Tournament (GPP)"
+    st.session_state.field_entries = max(2, contest["field"])
+    wta = re.search(r"winner.takes?.all", contest["name"], re.I) is not None
+    filled = {"name": contest["name"], "field": contest["field"], "error": None, "lineups": None}
+    try:
+        rules = lobby_contest_rules(contest["id"])
+        wta = wta or rules["winner_take_all"]
+        filled["lineups"] = st.session_state[lineups_key] = min(rules["max_per_user"], 150)
+    except Exception as exc:
+        filled["error"] = str(exc)
+    if pick_key.startswith("dk_contest_classic"):
+        st.session_state.is_wta = wta and not contest["is_cash"]
+        filled["wta"] = st.session_state.is_wta
+    filled["cash"] = contest["is_cash"]
+    st.session_state.contest_filled = filled
+
+
 st.set_page_config(page_title="DFS Lineup Optimizer", layout="wide")
 st.title("🏈 DFS Lineup Optimizer")
 
@@ -293,13 +332,17 @@ sport = st.sidebar.selectbox("Sport", ["NFL", "NBA", "MLB", "NHL"])
 # Showdown is a 6-man roster from one game, so the usable pool is tiny compared
 # with a main slate. Fewer lineups, min-unique on, and no global cap — with ~24
 # players some are unavoidable, so a cap just fails silently.
+lineups_key = "num_lineups_showdown" if is_showdown else "num_lineups_classic"
+if lineups_key not in st.session_state:
+    st.session_state[lineups_key] = 20 if is_showdown else 100
 num_lineups = st.sidebar.number_input(
-    "Number of lineups", min_value=1, max_value=150,
-    value=20 if is_showdown else 100, step=5 if is_showdown else 10)
+    "Number of lineups", min_value=1, max_value=150, step=5 if is_showdown else 10,
+    key=lineups_key)
 
 st.sidebar.subheader("Contest")
 contest_mode = st.sidebar.radio(
     "Type", ["Tournament (GPP)", "Cash (double-up)", "Custom randomness"],
+    key="contest_mode",
     help="Single-entry tournaments belong under Tournament: set Number of lineups to 1. "
          "Cash turns the simulation off. Randomness is jitter added to each projection "
          "before every solve, so lineups stop repeating. Bigger fields justify more of it.",
@@ -316,9 +359,12 @@ elif contest_mode == "Custom randomness":
             "projection for diversity. Exposure caps are usually the better lever."
         )
 else:
+    if "field_entries" not in st.session_state:
+        st.session_state.field_entries = 5_000
     field_entries = st.sidebar.number_input(
-        "Field size (entries)", min_value=2, max_value=2_000_000, value=5_000,
-        step=500, help="The contest's entry count. Check the lobby if unsure.",
+        "Field size (entries)", min_value=2, max_value=2_000_000, step=500,
+        key="field_entries", help="The contest's entry count. Pick the contest under the "
+                                  "slate to fill this in.",
     )
     deviation, field_note = randomness_for_field(field_entries)
     st.sidebar.caption(
@@ -485,6 +531,35 @@ with col1:
                                          key=f"dk_slate_{kind}")]
             lobby_group_id = pick["id"]
             try:
+                slate_contests = lobby_contests(pick["id"])
+            except Exception:
+                slate_contests = []
+            if slate_contests:
+                pick_key = f"dk_contest_{kind}_{pick['id']}"
+                st.selectbox(
+                    "Contest", slate_contests, index=None, key=pick_key,
+                    placeholder=f"Optional: choose from {len(slate_contests):,} contests",
+                    format_func=contest_label,
+                    on_change=apply_contest, args=(pick_key, lineups_key),
+                    help="Sets number of lineups to the contest's entry limit, plus field "
+                         "size and contest type in the sidebar. Change any of them after; "
+                         "your edit stays until you pick another contest.")
+                filled = st.session_state.get("contest_filled")
+                if filled and st.session_state.get(pick_key):
+                    if filled["cash"]:
+                        what = "Cash"
+                    elif filled.get("wta"):
+                        what = "Winner-take-all on"
+                    elif "wta" in filled:
+                        what = "Winner-take-all off"
+                    else:
+                        what = "Tournament"
+                    limit = f"{filled['lineups']}-entry limit · " if filled["lineups"] else ""
+                    st.caption(f"From the contest: {limit}{filled['field']:,} entries · {what}.")
+                    if filled["error"]:
+                        st.warning("Couldn't read this contest's entry limit, so number of "
+                                   f"lineups wasn't changed ({filled['error']}).")
+            try:
                 dk_content, fetched_at = lobby_salaries(pick["id"], kind)
             except Exception as exc:
                 st.warning(f"Couldn't load that slate's players ({exc}). Try again, or "
@@ -497,6 +572,7 @@ with col1:
                              help="Salaries rarely move, but players get scratched — "
                                   "refresh near lock to drop anyone already ruled out."):
                     lobby_slates.clear()
+                    lobby_contests.clear()
                     lobby_salaries.clear()
                     st.rerun()
 with col2:
