@@ -107,6 +107,13 @@ def classic_exposure_default(is_wta, lineups):
     return 35 if is_wta and lineups > 3 else 50
 
 
+def classic_mult_default(is_wta, lineups):
+    """Lineups built per lineup kept, main slate. Winner-take-all with 3 or fewer lineups
+    builds 60: in 118-entry WTAs, 60 beat 30 on every sim measure in two separate runs,
+    with real contests no worse. In 10x Boosters 60 added nothing, so 30 stays (2026-11-06)."""
+    return 60 if is_wta and lineups <= 3 else 30
+
+
 def randomness_for_field(entries):
     name, dev, _ = contest_tier(entries)
     lower = {"Small": "up to 3,000", "Medium": "3,001-5,000", "Large": "5,001-14,000",
@@ -331,7 +338,8 @@ if not is_showdown and contest_mode != "Cash (double-up)":
         help="Turn on for any contest where only first place pays. Sets max exposure "
              "from your number of lineups: 35% with more than 3 (money-tested on 475-entry "
              "$0.25 WTAs with 10 lineups, Weeks 3-8: 35% beat 50% in two separate runs and "
-             "25% lost), 50% with 3 or fewer (118-entry WTAs: 35% added nothing).")
+             "25% lost), 50% with 3 or fewer (118-entry WTAs: 35% added nothing). With 3 or "
+             "fewer it also builds 60 per lineup instead of 30.")
 sim_on = False
 if sport == "NFL" and contest_mode != "Cash (double-up)":
     st.sidebar.subheader("Simulation")
@@ -352,13 +360,15 @@ sd_exp, sd_mult, sd_top = showdown_defaults(field_entries)
 if sim_on:
     sim_mult = st.sidebar.select_slider(
         "Lineups to build and compare",
-        options=[2, 3, 5, 8, 10, 20, 30, 40, 60], value=sd_mult if is_showdown else 30,
+        options=[2, 3, 5, 8, 10, 20, 30, 40, 60], value=sd_mult if is_showdown else classic_mult_default(is_wta, num_lineups),
         format_func=lambda m: f"{m * num_lineups:,}",
         help="The optimizer builds this many lineups under all your rules, the sim "
              "plays the slate out thousands of times, and only your best "
              f"{num_lineups} are kept. A bigger pile gives the sim more to choose "
              "from, at the cost of a slower build. Main slate: 30 per lineup beat 5 "
              "on every build and measure (Week 5, about 90 seconds for 40). "
+             "Winner-take-all with 3 or fewer lineups defaults to 60: it beat 30 in the "
+             "118-entry WTA sim in two separate runs. "
              "Showdown, money-tested on 7 games: 40 per lineup beat 20 in the "
              "5,945-entry Dime Package, so fields of 3,001-14,000 default to 40; "
              "in boosters and 50k+ Dimes more lineups didn't pay.")
