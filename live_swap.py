@@ -51,11 +51,13 @@ def read_standings(text):
     ent["Points"] = pd.to_numeric(ent.Points, errors="coerce").fillna(0.0)
     ent["lineup"] = [[(sl, norm(n)) for sl, n in parse_lineup(x)] for x in ent.Lineup]
     players = {}
+    # DraftKings lists a player once per roster slot he was drafted at (e.g. WR 34.25%
+    # and FLEX 1.92%), so his ownership is the sum of his rows.
     pl = df[df.Player.notna()]
     for name, drafted, fpts in zip(pl.Player, pl["%Drafted"], pl.FPTS):
-        players[norm(name)] = dict(name=name.strip(),
-                                   drafted=float(str(drafted).rstrip("%") or 0),
-                                   fpts=float(fpts or 0))
+        p = players.setdefault(norm(name), dict(name=name.strip(), drafted=0.0,
+                                                fpts=float(fpts or 0)))
+        p["drafted"] += float(str(drafted).rstrip("%") or 0)
     return ent.reset_index(drop=True), players
 
 
