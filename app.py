@@ -18,6 +18,8 @@ from pydfs_lineup_optimizer.rules import OptimizerRule
 from pydfs_lineup_optimizer.solvers import SolverSign
 
 import sim
+import live_swap
+from datetime import datetime
 
 try:
     # Reads DraftKings' public lobby endpoints, no login. Optional: without the
@@ -291,6 +293,85 @@ def lineup_assistant(results, merged_df, csv_text, is_showdown, target, excluded
         chat.append({"role": "assistant", "content": reply})
     else:
         chat.pop()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def live_contest_detail(contest_id):
+    return live_swap.contest_detail(contest_id)
+
+
+@st.fragment
+def live_contest_section(merged_df, players, is_showdown):
+    """Mid-slate view of uploaded contest standings: where each entry stands,
+    who it has left, and real ownership of the players still to play."""
+    if is_showdown:
+        st.info("The live contest view covers main slates for now.", icon=":material/info:")
+        return
+    st.caption("After the early games, open each contest on DraftKings, download its "
+               "standings (CSV or zip) and upload them here. Information only: a 44-Sunday "
+               "replay found that simulator swap suggestions lost money versus holding, so "
+               "the call is yours.")
+    files = st.file_uploader("Contest standings", type=["csv", "zip"],
+                             accept_multiple_files=True, key="lv_files")
+    if "lv_user" not in st.session_state:
+        st.session_state.lv_user = "LarryLoveIV"
+    with st.container(horizontal=True):
+        me = st.text_input("Your DraftKings username", key="lv_user")
+        when_t = st.time_input("As of", value=None, key="lv_time",
+                               help="Players whose game starts after this count as still to "
+                                    "play. Leave empty for now.")
+    if not files:
+        return
+    start = {live_swap.norm(p.full_name): p.game_info.starts_at.replace(tzinfo=None)
+             for p in players if p.game_info and p.game_info.starts_at}
+    when = (datetime.combine(min(start.values()).date(), when_t) if when_t and start
+            else datetime.now())
+    is_late = lambda n: n in start and start[n] > when
+    salary = {live_swap.norm(p.full_name): p.salary for p in players}
+    proj_col = next((c for c in ("Projection", "ppg_projection", "AvgPoints")
+                     if c in merged_df.columns), None)
+    proj = ({live_swap.norm(n): v for n, v in zip(merged_df["Name"], merged_df[proj_col])}
+            if proj_col else {})
+    info = {live_swap.norm(p.full_name): {
+        "team": p.team, "pos": "/".join(p.positions),
+        "proj": round(float(proj[live_swap.norm(p.full_name)]), 1)
+        if pd.notna(proj.get(live_swap.norm(p.full_name))) else None,
+        "kickoff": start[live_swap.norm(p.full_name)].strftime("%-I:%M %p")
+        if live_swap.norm(p.full_name) in start else ""} for p in players}
+    pct = {k: st.column_config.NumberColumn(format="%.1f%%")
+           for k in ("Field %", "In the money now %", "Top 10% now %", "Yours %")}
+    for f in files:
+        try:
+            cid, text = live_swap.open_standings(f.name, f.getvalue())
+            ent, pl = live_swap.read_standings(text)
+            det = live_contest_detail(cid) if cid else None
+        except Exception as exc:
+            st.error(f"{f.name}: couldn't read it ({exc}).")
+            continue
+        info["_paid"] = live_swap.paid_places(det) if det else 0
+        s = live_swap.summarize(ent, pl, me, is_late, salary, info)
+        with st.container(border=True):
+            title = det["name"] if det else f.name
+            fee = f" · ${float(det.get('entryFee', 0)):,.2f}" if det else ""
+            st.markdown(f"**{title}**{fee} · {len(ent):,} entries"
+                        + (f" · {info['_paid']:,} paid" if info["_paid"] else ""))
+            st.caption((f"Cash line right now: {s['cash_line']:.2f} points · "
+                        if s["cash_line"] is not None else "No payout table found · ")
+                       + f"your entries: {s['mine']}")
+            if s["rows"].empty:
+                st.info(f"No entries for {me} in this contest.")
+            else:
+                st.dataframe(s["rows"].sort_values("Rank"), hide_index=True, width="stretch",
+                             column_config={"Salary left": st.column_config.NumberColumn(
+                                 format="$%d")})
+            st.markdown("Players still to play")
+            if s["own"].empty:
+                st.caption("Every game in this contest has started.")
+            else:
+                st.dataframe(s["own"].sort_values("Field %", ascending=False),
+                             hide_index=True, width="stretch",
+                             column_config={**pct, "Salary": st.column_config.NumberColumn(
+                                 format="$%d")})
 
 
 def contest_label(c):
@@ -3271,6 +3352,8 @@ if dk_content is not None:
             lineup_builder(merged_df, players, optimizer.settings, is_showdown,
                            field_entries, sim_top if sim_on else 0.005,
                            st.session_state.get("results"), opt_key)
+            st.subheader(("6." if is_showdown else "8.") + " Live Contest")
+            live_contest_section(merged_df, players, is_showdown)
 
     except Exception as e:
         st.error(f"Error processing file: {e}")
