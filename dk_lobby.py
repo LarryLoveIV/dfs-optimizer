@@ -1,4 +1,4 @@
-"""Today's DraftKings NFL slates and player pools, via the draft_kings client.
+"""Today's DraftKings NFL and NBA slates and player pools, via the draft_kings client.
 
 The client reads DraftKings' public lobby endpoints without logging in. A
 slate's pool is turned into the same CSV DraftKings' "Export to CSV" gives, so
@@ -15,9 +15,23 @@ from zoneinfo import ZoneInfo
 from draft_kings import Client
 from draft_kings.data import Sport
 
-CLASSIC, SHOWDOWN = 21, 96          # DraftKings contest_type_id
+CLASSIC, SHOWDOWN = 21, 96          # DraftKings contest_type_id (NFL)
+# contest_type_id of the classic and showdown slates, by sport.
+TYPES = {"NFL": (CLASSIC, SHOWDOWN), "NBA": (70, 81)}
+SPORTS = {"NFL": Sport.NFL, "NBA": Sport.NBA}
 ET = ZoneInfo("America/New_York")
 ROSTER = {"QB": "QB", "RB": "RB/FLEX", "WR": "WR/FLEX", "TE": "TE/FLEX", "DST": "DST"}
+
+
+def nba_roster(position):
+    """'PG/SG' -> 'PG/SG/G/UTIL', the Roster Position DraftKings' NBA export uses."""
+    ps = position.split("/")
+    slots = list(ps)
+    if {"PG", "SG"} & set(ps):
+        slots.append("G")
+    if {"SF", "PF"} & set(ps):
+        slots.append("F")
+    return "/".join(slots + ["UTIL"])
 COLUMNS = ["Position", "Name + ID", "Name", "ID", "Roster Position", "Salary",
            "Game Info", "TeamAbbrev", "AvgPointsPerGame"]
 
@@ -28,19 +42,20 @@ def clock(t, prefix=""):
     return t.strftime(prefix) + t.strftime("%I:%M %p").lstrip("0")
 
 
-def slates():
+def slates(sport="NFL"):
     """Open classic and showdown slates, soonest first.
 
     Each: {"id", "kind" ("classic"/"showdown"), "label", "games", "starts",
     "contests"}.
     """
-    details = Client().contests(sport=Sport.NFL)
+    classic, showdown = TYPES[sport]
+    details = Client().contests(sport=SPORTS[sport])
     by_group = defaultdict(list)
     for c in details.contests:
         by_group[c.draft_group_id].append(c)
     out = []
     for g in details.draft_groups:
-        if g.contest_type_id not in (CLASSIC, SHOWDOWN):
+        if g.contest_type_id not in (classic, showdown):
             continue
         contests = by_group[g.draft_group_id]
         # Contest names end in the slate's tag — "(Early Only)", "(BAL @ ATL)" —
@@ -50,7 +65,7 @@ def slates():
                         else "Main") for c in contests)
         tag = tags.most_common(1)[0][0] if tags else "Main"
         starts = g.starts_at.astimezone(ET)
-        kind = "classic" if g.contest_type_id == CLASSIC else "showdown"
+        kind = "classic" if g.contest_type_id == classic else "showdown"
         out.append({
             "id": g.draft_group_id, "kind": kind, "games": g.games_count,
             "starts": starts, "contests": len(contests),
@@ -60,13 +75,13 @@ def slates():
     return sorted(out, key=lambda s: (s["starts"], -s["games"]))
 
 
-def contests(draft_group_id):
+def contests(draft_group_id, sport="NFL"):
     """The slate's open contests, one per distinct name, fee and size, cheapest first.
 
     DraftKings runs many identical copies of a contest, and head-to-heads are left
     out. Each: {"id", "name", "fee", "field", "is_cash"}.
     """
-    details = Client().contests(sport=Sport.NFL)
+    details = Client().contests(sport=SPORTS[sport])
     out = {}
     for c in details.contests:
         if c.draft_group_id != draft_group_id or c.is_head_to_head:
@@ -88,7 +103,7 @@ def contest_rules(contest_id):
     return {"max_per_user": int(d["maximumEntriesPerUser"]), "winner_take_all": paid == 1}
 
 
-def salaries_csv(draft_group_id, kind):
+def salaries_csv(draft_group_id, kind, sport="NFL"):
     """The slate's player pool as DraftKings salary-export CSV text."""
     pool = Client().draftables(draft_group_id=draft_group_id).players
     pool = [p for p in pool if not p.is_disabled]          # game already locked
@@ -114,6 +129,7 @@ def salaries_csv(draft_group_id, kind):
                 + f" {comp.starts_at.astimezone(ET):%m/%d/%Y %I:%M%p} ET")
         name = p.name_details.display.strip()
         slot = (("CPT" if p.draftable_id in cpt_ids else "FLEX") if kind == "showdown"
+                else nba_roster(p.position_name) if sport == "NBA"
                 else ROSTER.get(p.position_name, p.position_name))
         rows.append([p.position_name, f"{name} ({p.draftable_id})", name, p.draftable_id,
                      slot, int(p.salary), game, p.team_details.abbreviation, 0])

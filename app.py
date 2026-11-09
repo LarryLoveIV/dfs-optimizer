@@ -168,13 +168,13 @@ def sim_pool(frame, pool_players):
 
 
 @st.cache_data(ttl=300, show_spinner="Reading the DraftKings lobby…")
-def lobby_slates():
-    return dk_lobby.slates()
+def lobby_slates(sport="NFL"):
+    return dk_lobby.slates(sport)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def lobby_contests(draft_group_id):
-    return dk_lobby.contests(draft_group_id)
+def lobby_contests(draft_group_id, sport="NFL"):
+    return dk_lobby.contests(draft_group_id, sport)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -183,9 +183,10 @@ def lobby_contest_rules(contest_id):
 
 
 @st.cache_data(ttl=300, show_spinner="Loading players from DraftKings…")
-def lobby_salaries(draft_group_id, kind):
+def lobby_salaries(draft_group_id, kind, sport="NFL"):
     """(salary-export CSV text, time fetched) for one slate."""
-    return dk_lobby.salaries_csv(draft_group_id, kind), time.strftime("%I:%M %p").lstrip("0")
+    return (dk_lobby.salaries_csv(draft_group_id, kind, sport),
+            time.strftime("%I:%M %p").lstrip("0"))
 
 
 @st.cache_data(ttl=120, show_spinner="Checking injury news on DraftKings…")
@@ -410,6 +411,10 @@ st.sidebar.header("Settings")
 site = st.sidebar.selectbox("Site", ["DraftKings", "DraftKings Showdown"])
 is_showdown = site == "DraftKings Showdown"
 sport = st.sidebar.selectbox("Sport", ["NFL", "NBA", "MLB", "NHL"])
+if sport == "NBA" and is_showdown:
+    st.info("NBA covers classic slates for now. Switch the site to **DraftKings**.",
+            icon=":material/info:")
+    st.stop()
 # Showdown is a 6-man roster from one game, so the usable pool is tiny compared
 # with a main slate. Fewer lineups, min-unique on, and no global cap — with ~24
 # players some are unavoidable, so a cap just fails silently.
@@ -575,15 +580,15 @@ col1, col2 = st.columns(2)
 with col1:
     dk_content = None
     lobby_group_id = None
-    sources = (["DraftKings lobby", "Upload CSV"] if sport == "NFL" and dk_lobby
+    sources = (["DraftKings lobby", "Upload CSV"] if sport in ("NFL", "NBA") and dk_lobby
                else ["Upload CSV"])
     salary_source = st.segmented_control("Salaries", sources, default=sources[0],
                                          required=True, key="salary_source")
     if salary_source == "Upload CSV":
         dk_file = st.file_uploader("DK/FD Salaries CSV", type="csv", key="dk")
-        st.link_button("Get DraftKings salaries", "https://www.draftkings.com/lobby#/NFL",
+        st.link_button("Get DraftKings salaries", f"https://www.draftkings.com/lobby#/{sport}",
                        icon=":material/open_in_new:",
-                       help="Opens the NFL lobby. Open a contest for the slate you want and "
+                       help=f"Opens the {sport} lobby. Open a contest for the slate you want and "
                             "use Export to CSV (Export Players List), then drop the file in "
                             "the box above.")
         if dk_file is not None:
@@ -592,7 +597,7 @@ with col1:
         kind = "showdown" if is_showdown else "classic"
         lobby_error, open_slates = None, []
         try:
-            open_slates = [x for x in lobby_slates() if x["kind"] == kind]
+            open_slates = [x for x in lobby_slates(sport) if x["kind"] == kind]
         except Exception as exc:
             lobby_error = exc
         if lobby_error:
@@ -609,10 +614,11 @@ with col1:
             labels = list(by_label)
             main = next((i for i, lab in enumerate(labels) if lab.startswith("Main")), 0)
             pick = by_label[st.selectbox("Slate", labels, index=main,
-                                         key=f"dk_slate_{kind}")]
+                                         key=f"dk_slate_{kind}" if sport == "NFL"
+                                         else f"dk_slate_{sport}_{kind}")]
             lobby_group_id = pick["id"]
             try:
-                slate_contests = lobby_contests(pick["id"])
+                slate_contests = lobby_contests(pick["id"], sport)
             except Exception:
                 slate_contests = []
             if slate_contests:
@@ -641,7 +647,7 @@ with col1:
                         st.warning("Couldn't read this contest's entry limit, so number of "
                                    f"lineups wasn't changed ({filled['error']}).")
             try:
-                dk_content, fetched_at = lobby_salaries(pick["id"], kind)
+                dk_content, fetched_at = lobby_salaries(pick["id"], kind, sport)
             except Exception as exc:
                 st.warning(f"Couldn't load that slate's players ({exc}). Try again, or "
                            "switch to **Upload CSV**.")
@@ -1427,10 +1433,24 @@ if dk_content is not None:
         proj_label = "ppg_projection"
         if cheatsheet_file is not None:
             cheat_df = pd.read_csv(cheatsheet_file)
+            if sport == "NBA":
+                # TwoGunGPT's NBA board headers (PLAYER, PROJ, CEIL, ...) -> the names
+                # used below, in case its download keeps the on-screen headers.
+                alias = {"player": "Name", "proj": "Projection", "projection": "Projection",
+                         "ceil": "Ceiling", "ceiling": "Ceiling", "min": "Minutes",
+                         "minutes": "Minutes", "own": "Ownership", "ownership": "Ownership",
+                         "sal": "Salary", "salary": "Salary", "pos": "Position",
+                         "team": "Team", "opp": "Opponent", "name": "Name", "id": "ID"}
+                cheat_df = cheat_df.rename(columns={c: alias[str(c).strip().lower()]
+                                                    for c in cheat_df.columns
+                                                    if str(c).strip().lower() in alias})
             cheat_cols = list(cheat_df.columns)   # before Name/_key are added
             # TwoGunGPT's Ceiling Board download: Projection/Median/Ceiling/Nuke
             # instead of ppg_projection, and DraftKings IDs to match on.
-            is_twogun = {"Name", "Projection", "Median", "Ceiling", "Nuke"} <= set(cheat_cols)
+            # TwoGunGPT's NBA board has Projection and Ceiling (plus Minutes), no
+            # Median or Nuke.
+            tg_nba = sport == "NBA" and {"Name", "Projection", "Ceiling"} <= set(cheat_cols)
+            is_twogun = tg_nba or {"Name", "Projection", "Median", "Ceiling", "Nuke"} <= set(cheat_cols)
             if is_twogun:
                 # A showdown board carries CPT columns; a main-slate board doesn't.
                 # The wrong one would mix ownership: a showdown file's "Ownership"
@@ -1444,14 +1464,22 @@ if dk_content is not None:
                         f"{'showdown' if is_showdown else 'main-slate'} file — mixing them would "
                         "use the wrong projections and ownership.")
                     st.stop()
-                proj_label = st.segmented_control(
-                    "Optimize on", ["Projection", "Median", "Ceiling", "Nuke"],
-                    default="Ceiling", required=True, key="twogun_target",
-                    help="TwoGunGPT file detected. Projection is his average game, "
-                         "Median his 50th percentile, Ceiling a top-20% game and Nuke "
-                         "a top-5% game. Ceiling is the default: money-tested on Weeks 3-5 "
-                         "with the simulation on, Ceiling with an open flex beat every other "
-                         "setup in boosters and standard GPPs.")
+                if tg_nba:
+                    proj_label = st.segmented_control(
+                        "Optimize on", ["Projection", "Ceiling"],
+                        default="Projection", required=True, key="twogun_target_nba",
+                        help="TwoGunGPT NBA board detected. Projection is his expected "
+                             "DraftKings points, Ceiling a top-20% game. NBA settings are "
+                             "not money-tested yet.")
+                else:
+                    proj_label = st.segmented_control(
+                        "Optimize on", ["Projection", "Median", "Ceiling", "Nuke"],
+                        default="Ceiling", required=True, key="twogun_target",
+                        help="TwoGunGPT file detected. Projection is his average game, "
+                             "Median his 50th percentile, Ceiling a top-20% game and Nuke "
+                             "a top-5% game. Ceiling is the default: money-tested on Weeks 3-5 "
+                             "with the simulation on, Ceiling with an open flex beat every other "
+                             "setup in boosters and standard GPPs.")
                 cheat_df["ppg_projection"] = cheat_df[proj_label]
                 # "Out ..." -> O, "Questionable (assumed playing)" -> Q, so the
                 # existing ruled-out filter applies.
@@ -1483,8 +1511,9 @@ if dk_content is not None:
             # 1:1 merge — a repeated name would otherwise multiply player rows.
             cheat_df = cheat_df.drop_duplicates(subset="_key")
             if is_twogun:
-                present = ["injury_status", "ppg_projection",
-                           "Projection", "Median", "Ceiling", "Nuke"]
+                present = ["injury_status", "ppg_projection"] + [
+                    c for c in ("Projection", "Median", "Ceiling", "Nuke", "Minutes")
+                    if c in cheat_df.columns]
                 present += [c for c in ("Ownership", "Small Field Ownership",
                                         "CPT Ownership", "FLEX Ownership")
                             if c in cheat_df.columns]
@@ -1639,7 +1668,7 @@ if dk_content is not None:
                 st.stop()
 
             qb_teams = set(merged_df.loc[merged_df["Position"].str.contains("QB"), "Team"])
-            no_qb_teams = sorted(set(merged_df["Team"]) - qb_teams)
+            no_qb_teams = sorted(set(merged_df["Team"]) - qb_teams) if sport == "NFL" else []
             if no_qb_teams:
                 st.warning(
                     f"{len(no_qb_teams)} team(s) have no projected QB "
@@ -2069,6 +2098,22 @@ if dk_content is not None:
                 batch_plan = [{"specs": [], "flex": None, "captain": None, "weight": 1.0,
                                "label": "showdown", "count": num_lineups}]
                 batch_counts = [num_lineups]
+        elif sport != "NFL":
+            # The opposing-team, same-team and stacking rules are built around NFL
+            # rosters (QB, DST, flex), so other sports get a plain build.
+            st.caption("The opposing-team, same-team and stack rules are NFL-only. Use the "
+                       "player pool above for locks, excludes and exposure, and the sidebar "
+                       "for lineup count, global exposure, min-unique and randomness.")
+            restrict_opposing = False
+            vs_dst_cap = None
+            first_team_positions, second_team_positions, max_allowed = [], [], 0
+            same_team_pairs = []
+            cap_no_qb = cap_with_qb = roster_slots
+            qb_stack_specs, flex_rows, mix_rows = [], [], []
+            mix_mode = False
+            batch_plan = [{"specs": [], "flex": None, "captain": None, "weight": 1.0,
+                           "label": sport, "count": num_lineups}]
+            batch_counts = [num_lineups]
         else:
             st.subheader("3. Opposing Team Position Restriction")
             has_game_info = bool(optimizer.player_pool.games)
@@ -2495,7 +2540,7 @@ if dk_content is not None:
                         f"{int(room * cap / 100 + 0.5)}. Raise the flex share or those "
                         "players' Max Exp %.")
 
-        st.subheader(("4." if is_showdown else "6.") + " Generate Lineups")
+        st.subheader(("4." if is_showdown else "6." if sport == "NFL" else "3.") + " Generate Lineups")
         if st.button("Generate Lineups"):
 
             def configure_optimizer(report=True, solver=None):
@@ -3334,15 +3379,17 @@ if dk_content is not None:
                            "three or more.")
                 st.dataframe(results["teams"], width="stretch", hide_index=True)
             with fcol:
-                st.subheader("Captain Breakdown" if is_showdown else "FLEX Breakdown")
+                st.subheader("Captain Breakdown" if is_showdown
+                             else "FLEX Breakdown" if sport == "NFL" else "Slot Breakdown")
                 if results.get("flex") is None:
                     st.caption("No multi-position slots on this roster.")
                 else:
                     st.caption("Which position was captained." if is_showdown
-                               else "Which position actually filled the flex slot.")
+                               else "Which position actually filled the flex slot."
+                               if sport == "NFL" else "Which position filled the open slots.")
                     st.dataframe(results["flex"], width="stretch", hide_index=True)
 
-            if agent is not None:
+            if agent is not None and sport == "NFL":
                 lineup_assistant(results, merged_df, content, is_showdown, proj_label,
                                  set(excluded_names), len(optimizer.settings.positions),
                                  optimizer.settings.budget, lobby_group_id)
