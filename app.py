@@ -3350,7 +3350,7 @@ if dk_content is not None:
                     key="combo_must_have", placeholder="Any player",
                     help="Only show groups that include all of these players.")
                 min_seen = st.number_input(
-                    "Seen in at least", min_value=1, max_value=max(n_built, 1), value=2,
+                    "Seen in at least", min_value=1, max_value=max(n_built, 1), value=min(2, max(n_built, 1)),
                     key="combo_min_seen", help="Lineups. Hides one-off groups.")
             combo_size = combo_size or 2
             if len(must_have) > combo_size:
