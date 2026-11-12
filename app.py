@@ -37,9 +37,15 @@ except Exception:
 try:
     # Same model, faster engine. Verified to produce identical lineups; if the
     # import fails the app just falls back to the library's default solver.
-    from or_solver import ORToolsSat as FAST_SOLVER
+    # fast_opt = the same engine, with upcoming lineups solved ahead of time on idle
+    # cores and kept only when provably the same answer (identical lineups, tested
+    # 2026-11-12). Set FAST_AHEAD=0 to switch it off.
+    from fast_opt import FastSat as FAST_SOLVER
 except Exception:
-    FAST_SOLVER = None
+    try:
+        from or_solver import ORToolsSat as FAST_SOLVER
+    except Exception:
+        FAST_SOLVER = None
 
 # Contest tiers by entry count — the user's own definitions. Each tier sets two
 # things:
