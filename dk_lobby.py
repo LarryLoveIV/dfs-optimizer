@@ -128,7 +128,8 @@ def salaries_csv(draft_group_id, kind, sport="NFL"):
         game = (comp.name.replace(" @ ", "@").replace(" vs ", "@")
                 + f" {comp.starts_at.astimezone(ET):%m/%d/%Y %I:%M%p} ET")
         name = p.name_details.display.strip()
-        slot = (("CPT" if p.draftable_id in cpt_ids else "FLEX") if kind == "showdown"
+        slot = (("CPT" if p.draftable_id in cpt_ids else "UTIL" if sport == "NBA" else "FLEX")
+                if kind == "showdown"
                 else nba_roster(p.position_name) if sport == "NBA"
                 else ROSTER.get(p.position_name, p.position_name))
         rows.append([p.position_name, f"{name} ({p.draftable_id})", name, p.draftable_id,

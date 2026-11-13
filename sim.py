@@ -699,3 +699,186 @@ def win_rate(score, field_scores, entries):
     b = below[ok].astype(float)
     out[ok] = np.exp(lg(b + 1) - lg(b - k + 1) - lg(m + 1) + lg(m - k + 1))
     return out
+
+
+# ================================================================== NBA
+# DraftKings NBA classic: PG, SG, SF, PF, C, G (PG/SG), F (SF/PF), UTIL; $50k.
+# Built 2026-11-11 and NOT money-tested yet: the score spread comes from each
+# player's TwoGunGPT Ceiling (a top-20% game), but the correlations, field
+# salary floor and duplicate curve below are starting values until NBA contest
+# results are in to fit them. Kept apart from the NFL code above.
+NBA_SLOTS = [("C", {"C"}), ("PG", {"PG"}), ("SG", {"SG"}), ("SF", {"SF"}), ("PF", {"PF"}),
+             ("G", {"PG", "SG"}), ("F", {"SF", "PF"}), ("UTIL", None)]   # most restrictive first
+NBA_FULL_OWN = 800.0                 # 8 roster spots: a board for the slate adds to 800%
+# Real field, 2026-11-09 $15 Fadeaway (15,682 entries): median $49.9k, 96% at $49.5k+,
+# 99.4% at $49k+. A $49.5k floor gives the sim field a $49.8k median.
+NBA_FIELD_MIN_SALARY = 49_500
+NBA_STARTER_MIN = 24.0               # projected minutes that count as a starter-sized role
+# Correlation of DK points between two players in the same game, by whether
+# each plays starter minutes (s) or bench minutes (b). Teammates share one
+# ball (usage) and one pool of minutes, so a blowout that sits the starters
+# hands their minutes to the bench; opponents share pace, overtime and the
+# game script (a close game keeps both sides' starters in, a blowout plays
+# both benches). Starting values, sized from public NBA DFS correlation work
+# (teammates ~0 to slightly negative, opponents slightly positive).
+NBA_SAME = {"ss": -0.05, "sb": -0.08, "bb": 0.04}
+NBA_OPP = {"ss": 0.07, "sb": -0.03, "bb": 0.08}
+
+
+def _nba_knots(proj, ceil):
+    """Quantile knots for one NBA player from his projection (mean) and
+    Ceiling (80th percentile). The spread is what the Ceiling implies under a
+    normal curve; median sits a little under the mean and the 95th a little
+    past the normal one, the right skew of a points distribution."""
+    sig = max((ceil - proj) / 0.8416, 0.05 * proj, 0.5)
+    med = max(proj - 0.15 * sig, 0.0)
+    c80 = max(ceil, med)
+    c95 = c80 + 1.1 * (1.645 - 0.8416) * sig
+    return _knots(proj, med, c80, c95, 0.0)
+
+
+def _nba_corr(team, opp, starter):
+    same = team[:, None] == team[None, :]
+    rival = team[:, None] == opp[None, :]
+    s = starter.astype(bool)
+    kind = np.where(s[:, None] & s[None, :], "ss", np.where(~s[:, None] & ~s[None, :], "bb", "sb"))
+    c = np.zeros((len(team), len(team)))
+    for k in ("ss", "sb", "bb"):
+        c[same & (kind == k)] = NBA_SAME[k]
+        c[rival & (kind == k)] = NBA_OPP[k]
+    np.fill_diagonal(c, 1.0)
+    vals, vecs = np.linalg.eigh(c)
+    c = (vecs * np.clip(vals, 1e-6, None)) @ vecs.T
+    d = np.sqrt(np.diag(c))
+    return c / np.outer(d, d)
+
+
+def nba_starters(players):
+    """True for players projected for starter-sized minutes (Minutes column),
+    else each team's top five by projection."""
+    if "Minutes" in players.columns and pd.to_numeric(players["Minutes"], errors="coerce").notna().any():
+        return pd.to_numeric(players["Minutes"], errors="coerce").fillna(0).to_numpy() >= NBA_STARTER_MIN
+    rank = players.groupby("Team")["Proj"].rank(ascending=False, method="first")
+    return (rank <= 5).to_numpy()
+
+
+def simulate_nba(players, n_sims=5000, seed=None):
+    """Simulated DK NBA points, shape (len(players), n_sims), float32.
+    players: Name, Team, Opp, Proj and optionally Ceiling and Minutes."""
+    players = players.reset_index(drop=True)
+    rng = np.random.default_rng(seed)
+    proj = players["Proj"].to_numpy(dtype=float)
+    ceil = (pd.to_numeric(players["Ceiling"], errors="coerce").to_numpy(dtype=float)
+            if "Ceiling" in players.columns else np.full(len(players), np.nan))
+    # No Ceiling: the spread TwoGunGPT's boards imply (sigma ~ 0.23 x proj + 3.1).
+    ceil = np.where(np.isfinite(ceil), ceil, proj + 0.8416 * (0.234 * proj + 3.12))
+    knots = np.array([_nba_knots(p, c) for p, c in zip(proj, ceil)]).reshape(-1, 5)
+    starter = nba_starters(players)
+    team = players.Team.astype(str).to_numpy(dtype=object)
+    opp = players.Opp.astype(str).to_numpy(dtype=object)
+    game = np.array(["@".join(sorted(p)) for p in zip(team, opp)])
+    z = np.empty((len(players), n_sims))
+    for g in np.unique(game):
+        idx = np.flatnonzero(game == g)
+        c = _nba_corr(team[idx], opp[idx], starter[idx])
+        z[idx] = np.linalg.cholesky(c) @ rng.standard_normal((len(idx), n_sims))
+    u = np.clip(_norm_cdf(z), 1e-9, 1 - 1e-9)
+    return _quantile(knots, u).astype(np.float32)
+
+
+def fit_ownership_nba(own):
+    """Ownership rescaled to add up to 800% (8 roster spots), no one above
+    100%. A board for this slate already does and is returned unchanged
+    (within OWN_FIT_TOLERANCE). The main-slate board on a smaller slate (the
+    8 pm turbo) doesn't: its players are scaled up in proportion. Plain
+    scaling likely understates how much a short slate piles onto its chalk."""
+    own = np.nan_to_num(np.asarray(own, dtype=float)).clip(0, 100)
+    if own.sum() <= 0 or abs(own.sum() - NBA_FULL_OWN) <= OWN_FIT_TOLERANCE * NBA_FULL_OWN:
+        return own
+    out = own.copy()
+    for _ in range(20):                       # rescale, cap at 100, repeat with the rest
+        capped = out >= 100
+        free = out[~capped].sum()
+        if free <= 0:
+            break
+        out[~capped] *= (NBA_FULL_OWN - 100 * capped.sum()) / free
+        out = out.clip(0, 100)
+        if abs(out.sum() - NBA_FULL_OWN) < 0.01:
+            break
+    return out
+
+
+def nba_eligibility(positions):
+    """(8 slots, players) bool: who can fill each DK NBA slot, from DK
+    positions like 'PG/SG' (G/F/UTIL entries in the string are ignored)."""
+    pos = [set(str(p).replace("/", " ").split()) for p in positions]
+    return np.array([[True if allowed is None else bool(allowed & p) for p in pos]
+                     for _, allowed in NBA_SLOTS])
+
+
+def _sample_nba(logw, elig, salary, n, rng):
+    """n field lineups, rows of 8 player indices, one weighted draw per slot
+    among players who can fill it and aren't taken yet. The slot order is
+    reshuffled for each eighth of the draws: always filling C first would cap
+    how often two chalky centers land together. Only lineups that fill every
+    slot inside the field's salary band are kept."""
+    out = []
+    for part in np.array_split(np.arange(n), 8):
+        m = len(part)
+        taken = np.zeros((m, len(logw)), dtype=bool)
+        ok = np.ones(m, dtype=bool)
+        pick = np.empty((m, len(NBA_SLOTS)), dtype=int)
+        for s in rng.permutation(len(NBA_SLOTS)):
+            keys = np.where(elig[s][None, :] & ~taken, logw[None, :] + _gumbel(rng, (m, len(logw))), -np.inf)
+            pick[:, s] = np.argmax(keys, axis=1)
+            ok &= np.isfinite(keys[np.arange(m), pick[:, s]])
+            taken[np.arange(m), pick[:, s]] = True
+        sal = salary[pick].sum(axis=1)
+        out.append(pick[ok & (sal <= SALARY_CAP) & (sal >= NBA_FIELD_MIN_SALARY)])
+    return np.vstack(out)
+
+
+def build_field_nba(players, own, n=5000, seed=None, iters=20):
+    """Simulated NBA opponents whose player exposures match `own` (percent).
+    players: Position (DK, e.g. 'PG/SG'), Salary. Same reweighting as the NFL
+    build_field. Returns (lineups as an (m, 8) index array, exposure error in points)."""
+    rng = np.random.default_rng(seed)
+    elig = nba_eligibility(players["Position"])
+    salary = players.Salary.to_numpy(dtype=float)
+    target = np.clip(np.nan_to_num(np.asarray(own, dtype=float)) / 100, 0, 1)
+    logw = np.where(target > 0, np.log(np.maximum(target, 1e-9)), -np.inf)
+    first, prev = None, logw.copy()
+    for _ in range(iters):
+        lu = _sample_nba(logw, elig, salary, 4 * n, rng)
+        if not len(lu) or (first is not None and len(lu) < first / 2):
+            logw = prev
+            break
+        first = first or len(lu)
+        expo = np.bincount(lu.ravel(), minlength=len(salary)) / len(lu)
+        ok = (target > 0) & (expo > 0)
+        prev = logw.copy()
+        logw[ok] += 0.8 * np.log(target[ok] / expo[ok])
+    field = np.empty((0, len(NBA_SLOTS)), dtype=int)
+    while len(field) < n:
+        more = _sample_nba(logw, elig, salary, 4 * n, rng)
+        if not len(more):
+            break
+        field = np.vstack([field, more])
+    field = field[:n]
+    expo = np.bincount(field.ravel(), minlength=len(salary)) / max(len(field), 1)
+    return field, float(np.abs(expo - target)[target > 0].mean() * 100)
+
+
+# NBA duplicates: copies of a lineup entered by OTHER users. Fitted on the
+# 2026-11-09 $15 Fadeaway (15,682 entries; 16.5% of entries shared their lineup
+# with another user; ownership product AUC 0.90). Same power as the NFL large-
+# field curve, about a third of its scale: the NFL curve predicted 34%. One
+# contest, not money-tested; refit as more NBA standings come in.
+NBA_DUPE_SCALE, NBA_DUPE_POWER = 0.03944, 0.65
+
+
+def expected_duplicates_nba(lineup_own, entries):
+    """Expected copies of each NBA lineup among the other `entries` - 1 entries."""
+    q = np.array([np.prod(np.clip(np.asarray(row, dtype=float), 0.01, 100) / 100)
+                  for row in lineup_own])
+    return max(entries - 1, 0) * NBA_DUPE_SCALE * q ** NBA_DUPE_POWER

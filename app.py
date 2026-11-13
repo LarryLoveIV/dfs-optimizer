@@ -417,10 +417,8 @@ st.sidebar.header("Settings")
 site = st.sidebar.selectbox("Site", ["DraftKings", "DraftKings Showdown"])
 is_showdown = site == "DraftKings Showdown"
 sport = st.sidebar.selectbox("Sport", ["NFL", "NBA", "MLB", "NHL"])
-if sport == "NBA" and is_showdown:
-    st.info("NBA covers classic slates for now. Switch the site to **DraftKings**.",
-            icon=":material/info:")
-    st.stop()
+# NBA showdown: CPT + 5 UTIL from one game. Other name for the non-captain slot only.
+flex_name = "UTIL" if sport == "NBA" else "FLEX"
 # Showdown is a 6-man roster from one game, so the usable pool is tiny compared
 # with a main slate. Fewer lineups, min-unique on, and no global cap — with ~24
 # players some are unavoidable, so a cap just fails silently.
@@ -479,14 +477,18 @@ if not is_showdown and contest_mode != "Cash (double-up)":
              "25% lost), 50% with 3 or fewer (118-entry WTAs: 35% added nothing). With 3 or "
              "fewer it also builds 60 per lineup instead of 30.")
 sim_on = False
-if sport == "NFL" and contest_mode != "Cash (double-up)":
+if (sport == "NFL" or (sport == "NBA" and not is_showdown)) and contest_mode != "Cash (double-up)":
     st.sidebar.subheader("Simulation")
     sim_on = st.sidebar.toggle(
         "Pick lineups by simulation", value=True,
         help="Builds extra lineups, simulates the slate thousands of times with "
              "teammates' and opponents' scores correlated the way they are in real games, "
              "then keeps the set of lineups that most often finishes near the top. Stack, "
-             "flex and QB + RB shares are kept.")
+             "flex and QB + RB shares are kept." if sport == "NFL" else
+             "Builds extra lineups, simulates the slate thousands of times (each player's "
+             "spread from his TwoGunGPT Ceiling; teammates and opponents tied together by "
+             "minutes and game script), then keeps the set of lineups that most often "
+             "finishes near the top. NBA version is new and not money-tested yet.")
     if sim_on and field_entries is None:
         field_entries = st.sidebar.number_input(
             "Field size (entries)", min_value=2, max_value=2_000_000, value=5_000,
@@ -534,8 +536,13 @@ if sim_on:
 st.sidebar.subheader("Exposure")
 global_max_exp = st.sidebar.slider(
     "Global max exposure %", min_value=0, max_value=100,
-    value=sd_exp if is_showdown else classic_exposure_default(is_wta, num_lineups), step=5,
-    help=("Set from the field size. Money-tested on 7 showdowns: with several "
+    value=(50 if sport != "NFL" else sd_exp) if is_showdown
+    else classic_exposure_default(is_wta, num_lineups), step=5,
+    help=("Default cap for every player, captain and UTIL lineups counted together. "
+          "100% means no cap. NBA showdown settings are not money-tested yet; 50% "
+          "matches the NBA classic default."
+          if is_showdown and sport != "NFL" else
+          "Set from the field size. Money-tested on 7 showdowns: with several "
           "entries, 100% (no cap) beat 50% by a wide margin in boosters and Dime "
           "Packages, and 80% lost; 50% stays only for tiny fields of 100 entries or "
           "fewer."
@@ -550,7 +557,7 @@ min_unique = st.sidebar.number_input(
     value=2 if is_showdown else 0, step=1,
     help="0 is off. At 2, no two lineups may share more than roster-2 players — it "
          "removes near-twin lineups that differ by a single name. On showdown this is "
-         "the main diversification lever (1 and 3 both lost money in testing).",
+         "the main diversification lever (1 and 3 both lost money in NFL testing).",
 )
 
 strategy_label = st.sidebar.selectbox(
@@ -672,9 +679,12 @@ with col2:
     cheatsheet_file = st.file_uploader("Projections Cheatsheet CSV", type="csv", key="cheat")
     # The download itself needs a signed-in browser (TwoGunGPT's terms bar
     # scripted access), so the app links to the board rather than fetching it.
-    st.link_button("Get TwoGunGPT projections", "https://twogungpt.com/projections/",
+    st.link_button("Get TwoGunGPT projections",
+                   "https://twogungpt.com/nba/projections/" if sport == "NBA"
+                   else "https://twogungpt.com/projections/",
                    icon=":material/open_in_new:",
-                   help="Opens the Ceiling Board. Sign in, pick the slate and press "
+                   help=("Opens the NBA board. " if sport == "NBA" else "Opens the Ceiling Board. ") +
+                        "Sign in, pick the slate and press "
                         "DOWNLOAD, then drop the CSV in the box above.")
 
 
@@ -686,6 +696,17 @@ def refit_note(raw_own):
                    "about 900%, so it's probably a board for another slate (e.g. the main "
                    "board on an afternoon slate). It was rescaled to a full lineup per "
                    "position for the simulated field and duplicates; treat those as rough.")
+
+
+def refit_note_nba(raw_own):
+    """NBA: say so when ownership was rescaled to fit the slate (sim.fit_ownership_nba)."""
+    total = float(np.nansum(raw_own))
+    if total > 0 and abs(total - sim.NBA_FULL_OWN) > sim.OWN_FIT_TOLERANCE * sim.NBA_FULL_OWN:
+        st.caption(f"This board's ownership adds up to {total:.0f}% on this slate instead of "
+                   "800%, so it's probably the main-slate board on a smaller slate (e.g. the "
+                   "8 pm turbo). It was scaled up to a full lineup for the simulated field "
+                   "and duplicates. Plain scaling likely understates how much a short slate "
+                   "piles onto its chalk, so treat those as rough.")
 
 
 def lineup_builder(merged_df, players, settings, is_showdown, field_default, top_default,
@@ -1462,7 +1483,11 @@ if dk_content is not None:
                 # The wrong one would mix ownership: a showdown file's "Ownership"
                 # is captain + flex for two teams, not a classic field's ownership.
                 file_is_showdown = bool({"CPT Salary", "CPT Ownership"} & set(cheat_cols))
-                if file_is_showdown != is_showdown:
+                if tg_nba and is_showdown:
+                    st.caption("TwoGunGPT's NBA board has no captain ownership, so showdown "
+                               "lineups are built from projections only. The captain scores "
+                               "and costs 1.5x.")
+                elif file_is_showdown != is_showdown:
                     st.error(
                         f"This is a TwoGunGPT **{'showdown' if file_is_showdown else 'main-slate'}** "
                         f"file, but the site is set to **{site}**. Switch the site in the "
@@ -2013,7 +2038,7 @@ if dk_content is not None:
             st.caption(
                 "One game, so the opposing-team, same-team and stacking rules don't "
                 "apply — every player already faces every other, and the roster is "
-                "CPT + 5 FLEX from two teams. Use the player pool above for locks, "
+                f"CPT + 5 {flex_name} from two teams. Use the player pool above for locks, "
                 "excludes and exposure, and the sidebar for lineup count, global "
                 "exposure, min-unique and randomness."
             )
@@ -2024,49 +2049,54 @@ if dk_content is not None:
             cap_no_qb = cap_with_qb = roster_slots
             qb_stack_specs, flex_rows, mix_rows = [], [], []
 
-            st.markdown("**Captain mix**")
-            st.caption(
-                "Minimum share of lineups captained by each position. The captain is worth "
-                "1.5x, so it is the biggest single decision on a showdown slate. Shares under "
-                "100% leave the rest open for the optimizer to choose (so QB 60% means at "
-                "least 60% QB captains). Leave the table empty to let projections choose — "
-                "which tends to settle on a handful of captains. Across 163 studied winning "
-                "showdown slates the top-1% captains were roughly WR 33%, RB 28%, QB 21%."
-            )
-            cpt_positions = sorted(
-                {r["Position"] for _, r in merged_df.iterrows() if r["Position"] != "?"},
-                key=lambda x: available_positions.index(x)
-                if x in available_positions else 99)
-            st.session_state.setdefault("cpt_rows", [])
-            st.session_state.setdefault("cpt_nonce", 0)
-            cpt_df = pd.DataFrame(
-                [{"Position": r["position"], "Share %": r["share"]}
-                 for r in st.session_state.cpt_rows],
-                columns=["Position", "Share %"])
-            cpt_df["Share %"] = cpt_df["Share %"].astype("Float64")
-            edited_cpt = st.data_editor(
-                cpt_df, num_rows="dynamic", width="content", hide_index=True,
-                column_config={
-                    "Position": st.column_config.SelectboxColumn(
-                        "Position", options=cpt_positions, required=True),
-                    "Share %": st.column_config.NumberColumn(
-                        "Share %", min_value=1, max_value=100, step=5, required=True),
-                },
-                key=f"cpt_editor_{st.session_state.cpt_nonce}",
-            )
-            collected_cpt = []
-            for _, row in edited_cpt.iterrows():
-                if pd.isna(row["Position"]) or pd.isna(row["Share %"]):
-                    continue
-                if row["Position"] in {r["position"] for r in collected_cpt}:
-                    continue
-                collected_cpt.append({"position": str(row["Position"]),
-                                      "share": float(row["Share %"])})
-            if collected_cpt != st.session_state.cpt_rows:
-                st.session_state.cpt_rows = collected_cpt
-                st.session_state.cpt_nonce += 1
-                st.rerun()
-            cpt_rows = st.session_state.cpt_rows
+            if sport == "NFL":
+                st.markdown("**Captain mix**")
+                st.caption(
+                    "Minimum share of lineups captained by each position. The captain is worth "
+                    "1.5x, so it is the biggest single decision on a showdown slate. Shares under "
+                    "100% leave the rest open for the optimizer to choose (so QB 60% means at "
+                    "least 60% QB captains). Leave the table empty to let projections choose — "
+                    "which tends to settle on a handful of captains. Across 163 studied winning "
+                    "showdown slates the top-1% captains were roughly WR 33%, RB 28%, QB 21%."
+                )
+                cpt_positions = sorted(
+                    {r["Position"] for _, r in merged_df.iterrows() if r["Position"] != "?"},
+                    key=lambda x: available_positions.index(x)
+                    if x in available_positions else 99)
+                st.session_state.setdefault("cpt_rows", [])
+                st.session_state.setdefault("cpt_nonce", 0)
+                cpt_df = pd.DataFrame(
+                    [{"Position": r["position"], "Share %": r["share"]}
+                     for r in st.session_state.cpt_rows],
+                    columns=["Position", "Share %"])
+                cpt_df["Share %"] = cpt_df["Share %"].astype("Float64")
+                edited_cpt = st.data_editor(
+                    cpt_df, num_rows="dynamic", width="content", hide_index=True,
+                    column_config={
+                        "Position": st.column_config.SelectboxColumn(
+                            "Position", options=cpt_positions, required=True),
+                        "Share %": st.column_config.NumberColumn(
+                            "Share %", min_value=1, max_value=100, step=5, required=True),
+                    },
+                    key=f"cpt_editor_{st.session_state.cpt_nonce}",
+                )
+                collected_cpt = []
+                for _, row in edited_cpt.iterrows():
+                    if pd.isna(row["Position"]) or pd.isna(row["Share %"]):
+                        continue
+                    if row["Position"] in {r["position"] for r in collected_cpt}:
+                        continue
+                    collected_cpt.append({"position": str(row["Position"]),
+                                          "share": float(row["Share %"])})
+                if collected_cpt != st.session_state.cpt_rows:
+                    st.session_state.cpt_rows = collected_cpt
+                    st.session_state.cpt_nonce += 1
+                    st.rerun()
+                cpt_rows = st.session_state.cpt_rows
+            else:
+                # Captain-by-position shares are an NFL idea (QB/RB/WR); NBA leaves the
+                # captain to the optimizer.
+                cpt_rows = []
 
             if cpt_rows:
                 ctot = sum(r["share"] for r in cpt_rows)
@@ -2944,7 +2974,8 @@ if dk_content is not None:
                 progress.write(f"simulating the slate {sim_runs:,} times…")
                 pool_df = sim_pool(merged_df, players)
                 row_of = {n: i for i, n in enumerate(pool_df["Name"])}
-                sims = sim.simulate(pool_df, sim_runs)
+                simulate = sim.simulate_nba if sport == "NBA" else sim.simulate
+                sims = simulate(pool_df, sim_runs)
                 members = [[(row_of[p.full_name], 1.5 if p.lineup_position == "CPT" else 1.0)
                             for p in lu.players if p.full_name in row_of] for lu in lineups]
                 scores = sim.score_lineups(members, sims)
@@ -2973,6 +3004,15 @@ if dk_content is not None:
                         # A captain's ownership is his CPT share, a flex player's
                         # his FLEX share.
                         slot_own = lambda i, mult: cpt_own[i] if mult > 1 else flex_own[i]
+                    elif sport == "NBA":
+                        raw_own = pd.to_numeric(pool_df["Ownership"], errors="coerce").fillna(0).to_numpy()
+                        own_arr = sim.fit_ownership_nba(raw_own)
+                        refit_note_nba(raw_own)
+                        pool_df["Own"] = own_arr
+                        field, field_err = sim.build_field_nba(
+                            sub, own_arr[salaried], n=FIELD_LINEUPS)
+                        field_members = [[(salaried[i], 1.0) for i in row] for row in field]
+                        slot_own = lambda i, mult: own_arr[i]
                     else:
                         raw_own = blend_ownership(pool_df, field_entries)
                         own_arr = sim.fit_ownership(pool_df["Pos"], raw_own)
@@ -2991,7 +3031,8 @@ if dk_content is not None:
                         thresh = np.quantile(sim.score_lineups(field_members, sims),
                                              1 - sim_top, axis=0)
                         lineup_own = [[slot_own(i, mult) for i, mult in m] for m in members]
-                        dupes = sim.expected_duplicates(lineup_own, field_entries)
+                        dupes = (sim.expected_duplicates_nba if sport == "NBA"
+                                 else sim.expected_duplicates)(lineup_own, field_entries)
                         share = 1 / (1 + dupes)
 
                 names = [{p.full_name for p in lu.players} for lu in lineups]
@@ -3028,7 +3069,7 @@ if dk_content is not None:
                 # would have kept (each batch's first lineups). Grading on the sims
                 # the picks were chosen on would flatter them.
                 base = [c for cands, keep in batches for c in cands[:keep]]
-                fresh_sims = sim.simulate(pool_df, sim_runs)
+                fresh_sims = simulate(pool_df, sim_runs)
                 fresh = sim.score_lineups(members, fresh_sims)
                 if field_on:
                     fresh_thresh = np.quantile(sim.score_lineups(field_members, fresh_sims),
@@ -3043,6 +3084,7 @@ if dk_content is not None:
                     "field": ({"lineups": len(field_members), "entries": field_entries,
                                "error": field_err,
                                "which": ("TwoGunGPT's CPT/FLEX ownership" if is_showdown
+                                         else "TwoGunGPT's NBA ownership" if sport == "NBA"
                                          else ownership_label(field_entries))}
                               if field_on else None),
                 }
@@ -3114,17 +3156,17 @@ if dk_content is not None:
             # captain is the biggest single call, so it gets its own breakdown.
             captain_df = None
             if is_showdown:
-                slot = picks["Position"].eq("CPT").map({True: "CPT", False: "FLEX"})
+                slot = picks["Position"].eq("CPT").map({True: "CPT", False: flex_name})
                 captain_df = (pd.crosstab([picks["Name"], picks["Team"]], slot)
-                              .reindex(columns=["CPT", "FLEX"], fill_value=0)
+                              .reindex(columns=["CPT", flex_name], fill_value=0)
                               .rename_axis(columns=None)
                               .reset_index())
                 captain_df.insert(1, "Position", captain_df["Name"].map(real_pos))
                 captain_df["CPT %"] = (captain_df["CPT"] / total * 100).round(1)
-                captain_df["FLEX %"] = (captain_df["FLEX"] / total * 100).round(1)
-                captain_df["Total %"] = captain_df["CPT %"] + captain_df["FLEX %"]
+                captain_df[f"{flex_name} %"] = (captain_df[flex_name] / total * 100).round(1)
+                captain_df["Total %"] = captain_df["CPT %"] + captain_df[f"{flex_name} %"]
                 captain_df = (captain_df[["Name", "Position", "Team", "CPT", "CPT %",
-                                          "FLEX", "FLEX %", "Total %"]]
+                                          flex_name, f"{flex_name} %", "Total %"]]
                               .sort_values(["CPT", "Total %"], ascending=False))
 
             # DK upload format: one row per lineup, one column per roster slot,
@@ -3326,7 +3368,7 @@ if dk_content is not None:
                 caps_df = results["captains"]
                 st.caption(
                     f"{int((caps_df['CPT'] > 0).sum())} different captains across "
-                    f"{int(results['lineups']['Lineup'].max())} lineups. **CPT** and **FLEX** count the "
+                    f"{int(results['lineups']['Lineup'].max())} lineups. **CPT** and **{flex_name}** count the "
                     "lineups where the player filled that slot; a player is never both "
                     "in one lineup, so **Total %** is their overall exposure.")
                 st.dataframe(caps_df, width="stretch", hide_index=True,
