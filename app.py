@@ -1683,6 +1683,37 @@ if dk_content is not None:
                     st.dataframe(dropped.sort_values(["Reason", "Position", "Name"]),
                                  width="stretch", hide_index=True)
 
+            # Questionable players the board still assumes will play. On the Weeks 3-9
+            # NFL main-slate boards 16 of 73 of them sat out (about 1 in 5), against
+            # 1 in 27 for everyone else, so they're worth a look before building.
+            if "injury_status" in merged_df.columns:
+                q_df = merged_df.loc[merged_df["injury_status"].astype(str).eq("Q")]
+                q_df = q_df.drop_duplicates("Name")
+                if len(q_df):
+                    q_names = q_df["Name"].tolist()
+                    q_left = [n for n in q_names if n not in st.session_state.excluded_names]
+                    st.warning(
+                        f"**{len(q_names)} Questionable "
+                        f"{'player is' if len(q_names) == 1 else 'players are'} still in the "
+                        "pool.** The projections assume they play. "
+                        + ("On past boards about 1 in 5 Questionable players sat out. "
+                           if sport == "NFL" else "")
+                        + "Check the latest news, and exclude anyone who is ruled out.",
+                        icon=":material/personal_injury:")
+                    with st.expander(f"Questionable players ({len(q_left)} not excluded)",
+                                     expanded=len(q_names) <= 8):
+                        q_cols = [c for c in ("Name", "Position", "Team", "Salary",
+                                              "ppg_projection", "Ownership")
+                                  if c in q_df.columns]
+                        q_show = q_df[q_cols].rename(columns={"ppg_projection": "Projection"})
+                        q_show["Excluded"] = q_show["Name"].isin(st.session_state.excluded_names)
+                        st.dataframe(q_show.sort_values("Projection", ascending=False),
+                                     width="stretch", hide_index=True)
+                        st.button(f"Exclude all {len(q_left)}", key="q_exclude_all",
+                                  icon=":material/block:", disabled=not q_left,
+                                  on_click=apply_to_shown,
+                                  kwargs={"names": q_left, "field": "exclude", "on": True})
+
             short, have = pool_shortfalls(merged_df)
             if short or len(merged_df) < roster_slots:
                 lines = [f"- **{pos}**: roster needs {need}, projections cover {got}"
