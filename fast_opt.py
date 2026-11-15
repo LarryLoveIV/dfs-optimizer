@@ -1,4 +1,4 @@
-"""Faster lineup building with the SAME lineups (dev prototype, not in the live app).
+"""Faster lineup building with the SAME lineups (look-ahead engine; deeper look-ahead on idle cores since 2026-11-14).
 
 What it does
 ------------
@@ -27,7 +27,7 @@ import os
 import random
 import time
 from collections import Counter, OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from ortools.linear_solver import pywraplp
 from pydfs_lineup_optimizer import LineupOptimizer
@@ -42,8 +42,10 @@ from pydfs_lineup_optimizer.solvers.exceptions import (SolverException,
 
 from or_solver import ORToolsSolver, ORVariable
 
-AHEAD = int(os.environ.get("FAST_AHEAD", "8"))            # lineups solved ahead of time; 0 = off (current engine)
-WORKERS = int(os.environ.get("FAST_WORKERS", "8"))        # early solves running at once
+AHEAD = int(os.environ.get("FAST_AHEAD", "10"))            # lineups always solved ahead; 0 = off (current engine)
+WORKERS = int(os.environ.get("FAST_WORKERS", "10"))        # early solves running at once
+DEEP = int(os.environ.get("FAST_DEEP", "16"))             # how far ahead to go when cores would otherwise sit idle
+SPILL = int(os.environ.get("FAST_SPILL", "2"))            # extra solves allowed at once for the nearest lineups
 SPEC_PARAMS = os.environ.get("FAST_SPEC_PARAMS", "num_workers:1,cp_model_presolve:false")
 MAIN_PARAMS = os.environ.get("FAST_MAIN_PARAMS", "num_workers:1,cp_model_presolve:false")
 STATS = Counter()
@@ -51,12 +53,13 @@ TIMES = Counter()      # seconds by phase
 RECORD = bool(os.environ.get("FAST_RECORD"))   # test harness only
 PICKS = []          # every solve's answer, in order (for the identical-lineups test)
 _POOL = None
+STATS_LAST = [None]
 
 
 def _pool():
     global _POOL
     if _POOL is None:
-        _POOL = ThreadPoolExecutor(max_workers=WORKERS)
+        _POOL = ThreadPoolExecutor(max_workers=WORKERS + SPILL + 1)
     return _POOL
 
 
@@ -212,6 +215,7 @@ def optimize(self, n, max_exposure=None, randomness=False, with_injured=None,
     player_list = list(players_dict)
     pool = _pool()
     pending = {}                    # lineup number -> (future, objective coefficients, rule keys, var names)
+    cache = {}                      # predicted projections for upcoming lineups (see _predict)
     previous_lineup = None
     try:
         for it in range(n):
@@ -228,48 +232,67 @@ def optimize(self, n, max_exposure=None, randomness=False, with_injured=None,
             true_obj = tuple(solver._objective[1])
             values = None
             job = pending.pop(it, None)
+            atoms = _atoms(extra_now) if extra_now is not None else None
+            now_keys = Counter(k for k, _ in atoms) if atoms is not None else None
+            look = None
+            if extra_now is not None:
+                look = dict(pool=pool, pending=pending, it=it, n=n, solver=solver, atoms=atoms,
+                            keys=now_keys, get_points=get_points, player_list=player_list,
+                            cache=cache, snap=None, head=None)
+            head = None
             if job is not None and extra_now is not None:
                 future, obj, keys, names = job
-                atoms = _atoms(extra_now)
-                now_keys = Counter(k for k, _ in atoms)
                 if obj != true_obj or names != set(solver._vars):
                     STATS["projections or variables changed"] += 1
+                    cache.clear()
                 elif keys - now_keys:
                     STATS["a rule was loosened"] += 1
                     for k in (keys - now_keys):
                         STATS["  loosened: " + ("block" if k[0] == "block" else str(k[2]))] += 1
                 else:
-                    t0 = time.perf_counter()
-                    early = future.result()
-                    TIMES["waiting for an early solve"] += time.perf_counter() - t0
-                    if early is None:
-                        STATS["early solve had no answer"] += 1
+                    head = future
+            if look is not None:
+                look["head"] = head
+                _look_ahead(look, True)
+            if head is not None:
+                t0 = time.perf_counter()
+                early = _wait(head, look)
+                TIMES["waiting for an early solve"] += time.perf_counter() - t0
+                if early is None:
+                    STATS["early solve had no answer"] += 1
+                else:
+                    added = now_keys - keys
+                    bad = [c for k, c in atoms if k in added and not _holds(c, early)]
+                    if not bad:
+                        values = early
+                        STATS["kept"] += 1
+                        STATS_LAST[0] = "kept"
                     else:
-                        added = now_keys - keys
-                        bad = [c for k, c in atoms if k in added and not _holds(c, early)]
-                        if not bad:
-                            values = early
-                            STATS["kept"] += 1
-                        else:
-                            STATS["broke a newer rule"] += 1
-                            for c in bad:
-                                STATS["  broke: " + str(c[4]).rstrip("0123456789")] += 1
+                        STATS["broke a newer rule"] += 1
+                        for c in bad:
+                            STATS["  broke: " + str(c[4]).rstrip("0123456789")] += 1
             if values is None:
                 STATS["solved normally"] += 1
-                # Solve ahead while this one is solved the normal way.
-                _look_ahead(pool, pending, it, n, solver, extra_now, get_points, player_list)
+                STATS_LAST[0] = "normal"
                 t0 = time.perf_counter()
-                values = _solve_values(solver._vars, solver._constraints, solver._objective,
-                                       MAIN_PARAMS)
+                # Same solve as before, run on a pool thread so further look-ahead can start meanwhile.
+                normal = pool.submit(_solve_values, solver._vars, solver._constraints, solver._objective,
+                                     MAIN_PARAMS)
+                if look is not None:
+                    look["head"] = normal
+                values = _wait(normal, look)
                 TIMES["normal solves (wall)"] += time.perf_counter() - t0
                 if values is None:
                     raise GenerateLineupException(
                         SolverInfeasibleSolutionException([]).get_user_defined_constraints())
-            else:
-                _look_ahead(pool, pending, it, n, solver, extra_now, get_points, player_list)
             solved_variables = [h for h in solver._vars.values() if round(values[h.name]) >= 1]
             if RECORD:
                 PICKS.append(sorted(h.name for h in solved_variables))
+                if os.environ.get("FAST_DUMP") and len(PICKS) - 1 == int(os.environ["FAST_DUMP"]):
+                    import pickle
+                    pickle.dump(dict(vars=solver._vars, cons=solver._constraints, obj=solver._objective, values=values,
+                                     kept=head is not None and values is not None and STATS_LAST[0] == "kept",
+                                     it=it, n=n), open("out/dump_%s.pkl" % os.environ["FAST_DUMP"], "wb"))
             lineup_players = []
             variables_names = []
             for solved_variable in solved_variables:
@@ -292,30 +315,69 @@ def optimize(self, n, max_exposure=None, randomness=False, with_injured=None,
             future.cancel()
 
 
-def _look_ahead(*a):
+def _wait(head, look):
+    """Wait for the solve the build needs next. While waiting, each time any solve finishes,
+    start look-ahead solves further out on the freed core."""
+    if look is None:
+        return head.result()
+    while not head.done():
+        running = [f for f, *_ in look["pending"].values() if not f.done()]
+        running.append(head)
+        wait(running, return_when=FIRST_COMPLETED)
+        if not head.done():
+            _look_ahead(look, False)
+    return head.result()
+
+
+def _predict(look, last):
+    """The projections the library will draw for lineups it+1..last. They are drawn now and the
+    random generator is rewound, so the library draws the very same ones. Earlier predictions are
+    reused only if the generator is exactly where they said it would be."""
+    cache, it = look["cache"], look["it"]
+    state = random.getstate()
+    if cache.get("at") != it or cache.get("state") != state:
+        cache.clear()
+        cache.update(at=it, state=state, obj={}, end=state, upto=it)
+    if cache["upto"] < last:
+        random.setstate(cache["end"])
+        get_points, player_list = look["get_points"], look["player_list"]
+        for j in range(cache["upto"] + 1, last + 1):
+            cache["obj"][j] = tuple(get_points(p) for p in player_list)
+        cache["end"] = random.getstate()
+        cache["upto"] = last
+        random.setstate(state)
+    return cache["obj"]
+
+
+def _look_ahead(look, new_rules):
     t0 = time.perf_counter()
     try:
-        return _look_ahead_(*a)
+        return _look_ahead_(look, new_rules)
     finally:
         TIMES["look-ahead bookkeeping"] += time.perf_counter() - t0
 
 
-def _look_ahead_(pool, pending, it, n, solver, extra_now, get_points, player_list):
-    """Start early solves for the next lineups that don't have one yet, and restart
-    any finished early solve that the rules known now have already ruled out."""
-    if extra_now is None:
+def _look_ahead_(look, new_rules):
+    """Start early solves for upcoming lineups that don't have one, nearest first, and (when the
+    rules just changed) restart any finished early solve the rules known now have ruled out.
+    The next AHEAD lineups always get one; beyond that, up to DEEP, only on a core that is free."""
+    pool, pending, it, n, solver = look["pool"], look["pending"], look["it"], look["n"], look["solver"]
+    atoms, keys = look["atoms"], look["keys"]
+    near = min(it + AHEAD, n - 1)
+    far = min(it + max(AHEAD, DEEP), n - 1)
+    if far <= it:
         return
-    last = min(it + AHEAD, n - 1)
-    if last <= it:
-        return
-    atoms = _atoms(extra_now)
-    keys = Counter(k for k, _ in atoms)
     names = set(solver._vars)
+    busy = sum(1 for f, *_ in pending.values() if not f.done())
+    if look["head"] is not None and not look["head"].done():
+        busy += 1
     todo = []
-    for j in range(it + 1, last + 1):
+    for j in range(it + 1, far + 1):
         job = pending.get(j)
         if job is None:
             todo.append(j)
+            continue
+        if not new_rules:
             continue
         future, _obj, old_keys, old_names = job
         if not future.done():
@@ -331,22 +393,30 @@ def _look_ahead_(pool, pending, it, n, solver, extra_now, get_points, player_lis
         if stale:
             todo.append(j)
             STATS["restarted early solve"] += 1
-    if not todo:
-        return
-    # The projections the library will draw for lineups it+1.. : draw them now,
-    # then rewind the random generator so the library draws the very same ones.
-    state = random.getstate()
-    objectives = {}
-    for j in range(it + 1, last + 1):
-        objectives[j] = tuple(get_points(p) for p in player_list)
-    random.setstate(state)
-    vars_ = dict(solver._vars)
-    cons = list(solver._constraints)
-    obj_vars = list(solver._objective[0])
+    start = []
+    for j in todo:                              # nearest first
+        if busy >= (WORKERS + SPILL if j <= near else WORKERS):
+            if j > near:
+                break
+            continue
+        start.append(j)
+        busy += 1
+    # A stale answer that could not be restarted now must not be mistaken for a fresh one later.
     for j in todo:
+        if j not in start and j in pending:
+            del pending[j]
+    if not start:
+        return
+    objectives = _predict(look, far)
+    if look["snap"] is None:
+        look["snap"] = (dict(solver._vars), list(solver._constraints), list(solver._objective[0]))
+    vars_, cons, obj_vars = look["snap"]
+    for j in start:
         future = pool.submit(_solve_values, vars_, cons, (obj_vars, objectives[j]), SPEC_PARAMS)
         pending[j] = (future, objectives[j], keys, names)
         STATS["started early"] += 1
+        if j > near:
+            STATS["  started beyond the usual window"] += 1
 
 
 LineupOptimizer.optimize = optimize
