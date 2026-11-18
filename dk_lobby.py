@@ -8,8 +8,12 @@ numbers the optimizer actually uses).
 """
 import csv
 import io
+import json
+import os
 import re
+import time
 from collections import Counter, defaultdict
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from draft_kings import Client
@@ -91,6 +95,89 @@ def contests(draft_group_id, sport="NFL"):
             "id": c.contest_id, "name": c.name, "fee": e.fee, "field": e.maximum,
             "is_cash": bool(c.is_double_up or c.is_fifty_fifty)})
     return sorted(out.values(), key=lambda c: (c["fee"], c["field"], c["name"]))
+
+
+SEEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "contests_seen.json")
+SEEN_DAYS = 6          # a slate not opened for this long is dropped from the file
+
+
+def contests_remembered(draft_group_id, sport="NFL", path=None):
+    """(contests, ids of the ones no longer in the lobby) for a slate.
+
+    DraftKings drops a contest from the lobby once it fills. Every contest seen
+    for a slate is kept in a small file next to the app, so a filled one can
+    still be picked. Slates not opened for SEEN_DAYS days are removed from the
+    file, so last week's contests clear themselves out. If the file can't be
+    read or written, this is just the live list.
+    """
+    live = contests(draft_group_id, sport)
+    path = path or SEEN_FILE
+    key = lambda c: f"{c['name']}|{c['fee']}|{c['field']}"
+    try:
+        try:
+            with open(path, encoding="utf-8") as f:
+                seen = json.load(f)
+        except (FileNotFoundError, ValueError):
+            seen = {}
+        now = time.time()
+        seen = {g: v for g, v in seen.items() if now - v.get("opened", 0) < SEEN_DAYS * 86400}
+        group = seen.setdefault(str(draft_group_id), {"sport": sport, "contests": {}})
+        group["opened"] = now
+        for c in live:
+            group["contests"][key(c)] = c
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(seen, f)
+        os.replace(tmp, path)
+        live_keys = {key(c) for c in live}
+        gone = [c for k, c in group["contests"].items() if k not in live_keys]
+    except Exception:
+        return live, set()
+    both = sorted(live + gone, key=lambda c: (c["fee"], c["field"], c["name"]))
+    return both, {c["id"] for c in gone}
+
+
+STARTED_HOURS = 10     # a slate that left the lobby stays pickable this long after its first game
+
+
+def slates_remembered(sport="NFL", path=None):
+    """slates(), plus slates that have started and left the lobby.
+
+    DraftKings drops a slate from the lobby when its first game locks, but its
+    player pool can still be read, which late swap needs. Every slate seen is
+    kept in the same file as the contests; one that is gone from the lobby and
+    started less than STARTED_HOURS ago is returned with "started": True.
+    """
+    live = slates(sport)
+    path = path or SEEN_FILE
+    try:
+        try:
+            with open(path, encoding="utf-8") as f:
+                seen = json.load(f)
+        except (FileNotFoundError, ValueError):
+            seen = {}
+        now = time.time()
+        for s in live:
+            group = seen.setdefault(str(s["id"]), {"sport": sport, "contests": {}})
+            group["opened"] = now
+            group["slate"] = {**s, "starts": s["starts"].isoformat()}
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(seen, f)
+        os.replace(tmp, path)
+        live_ids = {s["id"] for s in live}
+        gone = []
+        for g in seen.values():
+            s = g.get("slate")
+            if not s or g.get("sport") != sport or s["id"] in live_ids:
+                continue
+            starts = datetime.fromisoformat(s["starts"])
+            if 0 <= now - starts.timestamp() < STARTED_HOURS * 3600:
+                gone.append({**s, "starts": starts, "started": True,
+                             "label": s["label"] + " · started"})
+    except Exception:
+        return live
+    return sorted(live + gone, key=lambda s: (s["starts"], -s["games"]))
 
 
 def contest_rules(contest_id):

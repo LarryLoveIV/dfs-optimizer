@@ -17,3 +17,6 @@ env/
 
 # streamlit secrets (Gemini API key)
 .streamlit/secrets.toml
+
+# contests seen in the DraftKings lobby (rebuilt as the app is used)
+contests_seen.json

@@ -175,12 +175,14 @@ def sim_pool(frame, pool_players):
 
 @st.cache_data(ttl=300, show_spinner="Reading the DraftKings lobby…")
 def lobby_slates(sport="NFL"):
-    return dk_lobby.slates(sport)
+    """Open slates, plus ones that started today and left the lobby (for late swap)."""
+    return dk_lobby.slates_remembered(sport)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def lobby_contests(draft_group_id, sport="NFL"):
-    return dk_lobby.contests(draft_group_id, sport)
+    """(contests, ids of filled ones). Filled contests leave the lobby; they are remembered."""
+    return dk_lobby.contests_remembered(draft_group_id, sport)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -631,19 +633,24 @@ with col1:
                                          else f"dk_slate_{sport}_{kind}")]
             lobby_group_id = pick["id"]
             try:
-                slate_contests = lobby_contests(pick["id"], sport)
+                slate_contests, filled_ids = lobby_contests(pick["id"], sport)
             except Exception:
-                slate_contests = []
+                slate_contests, filled_ids = [], set()
             if slate_contests:
                 pick_key = f"dk_contest_{kind}_{pick['id']}"
                 st.selectbox(
                     "Contest", slate_contests, index=None, key=pick_key,
                     placeholder=f"Optional: choose from {len(slate_contests):,} contests",
-                    format_func=contest_label,
+                    format_func=lambda c: contest_label(c) + (" · filled" if c["id"] in filled_ids else ""),
                     on_change=apply_contest, args=(pick_key, lineups_key),
                     help="Sets number of lineups to the contest's entry limit, plus field "
                          "size and contest type in the sidebar. Change any of them after; "
-                         "your edit stays until you pick another contest.")
+                         "your edit stays until you pick another contest. Contests that "
+                         "filled and left the DraftKings lobby stay in this list, marked "
+                         "filled, if the app saw them while they were open.")
+                if filled_ids:
+                    st.caption(f"{len(filled_ids)} of these filled and left the lobby; "
+                               "they are kept here, marked filled.")
                 filled = st.session_state.get("contest_filled")
                 if filled and st.session_state.get(pick_key):
                     if filled["cash"]:
