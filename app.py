@@ -309,19 +309,148 @@ def live_contest_detail(contest_id):
     return live_swap.contest_detail(contest_id)
 
 
+@st.cache_data(ttl=120, show_spinner="Checking injury news on DraftKings…")
+def live_tags_started(ids):
+    """{DraftKings ID: injury tag} from whichever NFL classic slate (open or started
+    today) holds these players."""
+    best = {}
+    for s in dk_lobby.slates_remembered("NFL"):
+        if s.get("kind") != "classic":
+            continue
+        found = dk_lobby.player_status(ids, "classic", s["id"])
+        if len(found) > len(best):
+            best = found
+        if len(best) == len(ids):
+            break
+    return best
+
+
+def ruled_out_swaps(full, merged_df, players, info, salary, is_late, own_proj):
+    """Late players in your entries who can't score (Out on the board, no projection on
+    the new board, or tagged out by DraftKings), the best replacement for each, and a
+    file to upload the swaps to DraftKings. Everyone whose game started stays."""
+    st.markdown("**Ruled-out players in your lineups**")
+    by_name = merged_df.drop_duplicates("Name").set_index("Name")
+    col = lambda c: by_name[c] if c in by_name.columns else pd.Series(dtype=float)
+    # Replacements rank on the plain projection: in a 46-Sunday test (forced swaps of
+    # ruled-out late players, 90k real lineups) it matched or beat Ceiling and the simulator.
+    mean = col("Projection")
+    target = mean if "Projection" in by_name.columns else col("ppg_projection")
+    status = col("injury_status")
+    pool = {}
+    for p in players:
+        n = live_swap.norm(p.full_name)
+        if n in pool:
+            continue
+        t = pd.to_numeric(pd.Series([target.get(p.full_name)]), errors="coerce").iloc[0]
+        m = pd.to_numeric(pd.Series([mean.get(p.full_name)]), errors="coerce").iloc[0]
+        pool[n] = {"name": p.full_name, "pos": set(p.positions), "salary": int(p.salary),
+                   "target": float(t) if pd.notna(t) else 0.0,
+                   "proj": float(m) if pd.notna(m) else None,
+                   "status": str(status.get(p.full_name, "") or ""),
+                   "own": own_proj.get(n), "kickoff": info.get(n, {}).get("kickoff", "")}
+    with st.container(horizontal=True, vertical_alignment="center"):
+        check = st.button("Check DraftKings injury news", icon=":material/refresh:",
+                          key="lv_tags_btn",
+                          help="Reads DraftKings' injury tag (OUT, IR, ...) for the late "
+                               "players in your entries. Cached for 2 minutes.")
+        if check:
+            live_tags_started.clear()
+            st.session_state.lv_tags_on = True
+    tags = {}
+    if st.session_state.get("lv_tags_on") and dk_lobby is not None:
+        late_ids = tuple(sorted({pid for e in full["entries"].values()
+                                 for _, n, _, pid in e["lineup"] if pid and is_late(n)}))
+        try:
+            by_id = live_tags_started(late_ids) if late_ids else {}
+            name_of_id = {pid: n for n, pid in full["ids"].items()}
+            tags = {name_of_id[i]: t for i, t in by_id.items() if i in name_of_id}
+            st.caption(f"DraftKings injury tags checked {time.strftime('%I:%M %p').lstrip('0')}"
+                       f" for {len(by_id)} of {len(late_ids)} late players.")
+        except Exception as exc:
+            st.caption(f"DraftKings injury tags unavailable ({exc}).")
+    flagged = []
+    for eid, e in full["entries"].items():
+        L = [(sl, n) for sl, n, _, _ in e["lineup"]]
+        outs = [(i, live_swap.ruled_out(n, pool, tags)) for i, (_, n) in enumerate(L)
+                if is_late(n)]
+        outs = [(i, why) for i, why in outs if why]
+        if outs:
+            flagged.append((eid, e, L, outs))
+    late_total = sum(1 for e in full["entries"].values() for _, n, _, _ in e["lineup"]
+                     if is_late(n))
+    if not flagged:
+        st.success(f"None of the {late_total} late players in your {len(full['entries'])} "
+                   "entries is ruled out on the board"
+                   + (" or on DraftKings." if tags else ". Check DraftKings for the latest."),
+                   icon=":material/check_circle:")
+        return
+    st.warning(f"{len(flagged)} of your entries have a late player who can't score. Swapping "
+               "him out is a sure gain (he scores 0); replacements are ranked by projection "
+               "(it matched or beat Ceiling and the simulator in a 46-Sunday test).", icon=":material/personal_injury:")
+    tlabel = "proj"
+    label = lambda n: (f"{pool[n]['name']} · {'/'.join(sorted(pool[n]['pos']))} · "
+                       f"${pool[n]['salary']:,} · {tlabel} {pool[n]['target']:.1f}"
+                       + (f" · own {pool[n]['own']:.0f}%" if pool[n].get("own") is not None
+                          else "") + f" · {pool[n]['kickoff']}")
+    changes = {}
+    for eid, e, L, outs in flagged:
+        opt = live_swap.swap_options(L, [i for i, _ in outs], pool, is_late, tags)
+        with st.container(border=True):
+            st.markdown(f"Entry {eid} · {e['contest']}")
+            for i, why in outs:
+                st.markdown(f"- **{e['lineup'][i][2]}** ({L[i][0]}) — {why}")
+            if opt["best"] is None:
+                st.error("No replacement fits the salary left "
+                         f"(${opt['budget']:,} for the open slots).")
+                continue
+            picks = {}
+            for k, (i, _) in enumerate(outs):
+                options = list(dict.fromkeys([opt["best"][k]] + opt["choices"][k]))
+                picks[i] = st.selectbox(f"Replace {e['lineup'][i][2]} ({L[i][0]}) with",
+                                        options, index=0, format_func=label,
+                                        key=f"lv_swap_{eid}_{i}")
+            spend = sum(pool[n]["salary"] for n in picks.values())
+            if len(set(picks.values())) < len(picks):
+                st.error("The same player is picked twice.")
+                continue
+            if spend > opt["budget"]:
+                st.error(f"Over the salary cap by ${spend - opt['budget']:,}.")
+                continue
+            st.caption(f"Budget for the open slots ${opt['budget']:,} · picked ${spend:,}")
+            changes[eid] = {i: (n, pool[n]["name"]) for i, n in picks.items()}
+    if changes:
+        text, problems = live_swap.swap_file(full, changes)
+        for p in problems:
+            st.error(p)
+        st.download_button(f"Download swap file ({len(changes) - len(problems)} entries)",
+                           text, file_name="dk_late_swap.csv", mime="text/csv",
+                           icon=":material/download:", key="lv_swap_dl",
+                           help="Upload it on DraftKings (Lineups → Edit entries → Upload) "
+                                "to make every swap at once. Only the entries listed above "
+                                "change.")
+
+
 @st.fragment
 def live_contest_section(merged_df, players, is_showdown):
-    """Mid-slate view of uploaded contest standings: where each entry stands,
-    who it has left, and real ownership of the players still to play."""
+    """Mid-slate view of uploaded contest standings: each entry's full current lineup,
+    where it stands, who it has left, and the players still to play."""
     if is_showdown:
         st.info("The live contest view covers main slates for now.", icon=":material/info:")
         return
     st.caption("After the early games, open each contest on DraftKings, download its "
-               "standings (CSV or zip) and upload them here. Information only: a 44-Sunday "
-               "replay found that simulator swap suggestions lost money versus holding, so "
-               "the call is yours.")
+               "standings (CSV or zip) and upload them here, together with your entries "
+               "file (the DKEntries.csv DraftKings gives you to edit entries). Information "
+               "only: a 44-Sunday replay found that simulator swap suggestions lost money "
+               "versus holding, so the keep-or-swap call is yours.")
     files = st.file_uploader("Contest standings", type=["csv", "zip"],
                              accept_multiple_files=True, key="lv_files")
+    entry_files = st.file_uploader(
+        "Your entries (DKEntries.csv)", type=["csv"], accept_multiple_files=True,
+        key="lv_entries",
+        help="Until a game starts, DraftKings hides its players in the standings (shown as "
+             "LOCKED), even yours. Your entries file lists all of your players, so the "
+             "screen can show your full lineups, players left and salary.")
     if "lv_user" not in st.session_state:
         st.session_state.lv_user = "LarryLoveIV"
     with st.container(horizontal=True):
@@ -329,8 +458,20 @@ def live_contest_section(merged_df, players, is_showdown):
         when_t = st.time_input("As of", value=None, key="lv_time",
                                help="Players whose game starts after this count as still to "
                                     "play. Leave empty for now.")
-    if not files:
+    if not files and not entry_files:
         return
+    my_lineups, my_full = {}, dict(slots=[], entries={}, ids={})
+    for ef in entry_files or []:
+        try:
+            full = live_swap.read_entries_full(ef.getvalue())
+        except Exception as exc:
+            st.error(f"{ef.name}: couldn't read it ({exc}).")
+            continue
+        my_full["slots"] = my_full["slots"] or full["slots"]
+        my_full["entries"].update(full["entries"])
+        my_full["ids"].update(full["ids"])
+    my_lineups = {k: [(sl, n, nm) for sl, n, nm, _ in e["lineup"]]
+                  for k, e in my_full["entries"].items()}
     start = {live_swap.norm(p.full_name): p.game_info.starts_at.replace(tzinfo=None)
              for p in players if p.game_info and p.game_info.starts_at}
     when = (datetime.combine(min(start.values()).date(), when_t) if when_t and start
@@ -341,14 +482,24 @@ def live_contest_section(merged_df, players, is_showdown):
                      if c in merged_df.columns), None)
     proj = ({live_swap.norm(n): v for n, v in zip(merged_df["Name"], merged_df[proj_col])}
             if proj_col else {})
+    own_proj = ({live_swap.norm(n): float(v) for n, v in
+                 zip(merged_df["Name"], pd.to_numeric(merged_df["Ownership"], errors="coerce"))
+                 if pd.notna(v)} if "Ownership" in merged_df.columns else {})
     info = {live_swap.norm(p.full_name): {
-        "team": p.team, "pos": "/".join(p.positions),
+        "name": p.full_name, "team": p.team, "pos": "/".join(p.positions),
         "proj": round(float(proj[live_swap.norm(p.full_name)]), 1)
         if pd.notna(proj.get(live_swap.norm(p.full_name))) else None,
         "kickoff": start[live_swap.norm(p.full_name)].strftime("%-I:%M %p")
         if live_swap.norm(p.full_name) in start else ""} for p in players}
     pct = {k: st.column_config.NumberColumn(format="%.1f%%")
-           for k in ("Field %", "In the money now %", "Top 10% now %", "Yours %")}
+           for k in ("Field %", "In the money now %", "Top 10% now %", "Yours %", "Proj. own %",
+                     "Own %")}
+    money = {k: st.column_config.NumberColumn(format="$%d")
+             for k in ("Salary", "Salary left", "Late-swap budget")}
+    if my_full["entries"]:
+        ruled_out_swaps(my_full, merged_df, players, info, salary, is_late, own_proj)
+    if not files:
+        return
     for f in files:
         try:
             cid, text = live_swap.open_standings(f.name, f.getvalue())
@@ -358,29 +509,62 @@ def live_contest_section(merged_df, players, is_showdown):
             st.error(f"{f.name}: couldn't read it ({exc}).")
             continue
         info["_paid"] = live_swap.paid_places(det) if det else 0
-        s = live_swap.summarize(ent, pl, me, is_late, salary, info)
+        s = live_swap.summarize(ent, pl, me, is_late, salary, info, my_lineups, own_proj)
         with st.container(border=True):
             title = det["name"] if det else f.name
             fee = f" · ${float(det.get('entryFee', 0)):,.2f}" if det else ""
             st.markdown(f"**{title}**{fee} · {len(ent):,} entries"
                         + (f" · {info['_paid']:,} paid" if info["_paid"] else ""))
+            fl = s["field_left"]
             st.caption((f"Cash line right now: {s['cash_line']:.2f} points · "
                         if s["cash_line"] is not None else "No payout table found · ")
-                       + f"your entries: {s['mine']}")
+                       + f"your entries: {s['mine']} · players still to play, on average: "
+                       f"whole field {fl['field']}"
+                       + (f", in the money now {fl['cashing']}" if fl["cashing"] is not None else "")
+                       + f", top 10% {fl['top']}")
             if s["rows"].empty:
                 st.info(f"No entries for {me} in this contest.")
             else:
-                st.dataframe(s["rows"].sort_values("Rank"), hide_index=True, width="stretch",
-                             column_config={"Salary left": st.column_config.NumberColumn(
-                                 format="$%d")})
+                if s["hidden"] and s["filled"] < s["mine"]:
+                    st.warning(
+                        f"DraftKings hides players whose game hasn't started (LOCKED), even "
+                        f"yours: {s['mine'] - s['filled']} of your {s['mine']} entries here "
+                        "aren't in an uploaded entries file, so their late players, salary "
+                        "left and projected final are unknown. Upload your DKEntries.csv.",
+                        icon=":material/visibility_off:")
+                st.dataframe(
+                    s["rows"].sort_values("Rank"), hide_index=True, width="stretch",
+                    column_config={**money,
+                                   "Proj. left": st.column_config.NumberColumn(
+                                       help="Board projection of the players still to play."),
+                                   "Proj. final": st.column_config.NumberColumn(
+                                       help="Points so far plus the projection of the players "
+                                            "still to play."),
+                                   "Late-swap budget": st.column_config.NumberColumn(
+                                       format="$%d",
+                                       help="$50,000 minus the players whose game has started: "
+                                            "what the late slots can spend in a swap.")})
+                for _, row in s["rows"].sort_values("Rank").iterrows():
+                    with st.expander(f"Entry {row['Entry']} · rank {row['Rank']:,} · "
+                                     f"{row['Points']:.2f} pts · {row['Players left']} left"):
+                        st.dataframe(s["lineups"][row["Entry"]], hide_index=True, width="stretch",
+                                     column_config={**money, **pct, "Own %": st.column_config.NumberColumn(
+                                         format="%.1f%%",
+                                         help="Real ownership in this contest for players who "
+                                              "have started; the board's projected ownership "
+                                              "for players still to play (DraftKings hides "
+                                              "theirs until kickoff).")})
             st.markdown("Players still to play")
             if s["own"].empty:
                 st.caption("Every game in this contest has started.")
             else:
-                st.dataframe(s["own"].sort_values("Field %", ascending=False),
+                if s["hidden"]:
+                    st.caption("DraftKings leaves these players out of the standings until "
+                               "their game starts, so ownership here is the board's "
+                               "projection.")
+                st.dataframe(s["own"].sort_values("Proj", ascending=False),
                              hide_index=True, width="stretch",
-                             column_config={**pct, "Salary": st.column_config.NumberColumn(
-                                 format="$%d")})
+                             column_config={**pct, **money})
 
 
 def contest_label(c):
@@ -1029,6 +1213,94 @@ def score_histogram(score, line, top):
                                         color="gray").encode(
         x="x:Q", y=alt.value(0), text="label:N")
     return bars + rule + text
+
+
+def wide_lineups(long_df, sim_df, note):
+    """One row per lineup (players across, by roster slot) with its salary, points and,
+    when the simulation ran, the numbers it was ranked by. Also returns a short note on
+    why lineup 1 is ahead of lineup 2 (or None)."""
+    picks = long_df[long_df["Position"] != "TOTAL"]
+    totals = long_df[long_df["Position"] == "TOTAL"].set_index("Lineup")
+    sets, rows = {}, []
+    for lid, grp in picks.groupby("Lineup", sort=True):
+        row, seen = {"#": int(lid)}, Counter()
+        roster = Counter(grp["Position"])
+        for pos, name in zip(grp["Position"], grp["Name"]):
+            seen[pos] += 1
+            row[f"{pos}{seen[pos]}" if roster[pos] > 1 else pos] = str(name).strip()
+        row["Salary"] = int(totals.at[lid, "Salary"]) if lid in totals.index else None
+        row["Opt. pts"] = totals.at[lid, "AvgPoints"] if lid in totals.index else None
+        sets[lid] = {(str(n).strip(), p == "CPT") for n, p in zip(grp["Name"], grp["Position"])}
+        rows.append(row)
+    wide = pd.DataFrame(rows)
+    first = min(sets) if sets else None
+
+    def changes(lid):
+        if lid == first:
+            return "—"
+        names = lambda k: {n for n, _ in sets[k]}
+        cpt = lambda k: next((n for n, c in sets[k] if c), None)
+        new, old = names(lid) - names(first), names(first) - names(lid)
+        parts = []
+        if cpt(lid) != cpt(first):
+            parts.append(f"CPT {cpt(first)} → {cpt(lid)}")
+        if len(new) > 3:
+            parts.append(f"{len(new)} of {len(sets[lid])} players different")
+        else:
+            parts += [f"+{n}" for n in sorted(new)] + [f"−{n}" for n in sorted(old)]
+        return ", ".join(parts) or "same players"
+    why = None
+    if sim_df is not None and len(sim_df):
+        s = sim_df.set_index("Lineup")
+        rate_col = next(c for c in s.columns if c.startswith("Top ") and c.endswith(" rate"))
+        keeps = s["Keeps %"] if "Keeps %" in s.columns else pd.Series(100.0, index=s.index)
+        score = s["Rank score"] if "Rank score" in s.columns else s[rate_col] * keeps / 100
+        wide["Rank score"] = wide["#"].map(score)
+        wide["vs #1"] = (wide["Rank score"] / score.iloc[0] * 100).round(0) if score.iloc[0] else None
+        wide[rate_col] = wide["#"].map(s[rate_col])
+        wide["Keeps %"] = wide["#"].map(keeps)
+        for c in ("Exp. duplicates", "Total own %", "Sim avg", "Sim 99th"):
+            if c in s.columns:
+                wide[c] = wide["#"].map(s[c])
+        top, runs = note.get("top", 0), note.get("runs", 0)
+        r1, k1, s1 = s[rate_col].iloc[0], keeps.iloc[0], score.iloc[0]
+        dup = ("" if "Keeps %" in s.columns
+               else " There is no ownership in the file, so nothing is split with duplicates.")
+        why = (f"**Why lineup 1 is first.** Lineups are ordered by rank score: how often a "
+               f"lineup finishes in the top {top:.1%} of the simulated contest, times how much "
+               f"of that finish it keeps after the duplicates the field is expected to enter."
+               f"{dup} Lineup 1 finishes there in {r1:.2f}% of {runs:,} simulations and keeps "
+               f"{k1:.0f}%, a rank score of {s1:.3f}.")
+        if len(s) > 1:
+            r2, k2, s2 = s[rate_col].iloc[1], keeps.iloc[1], score.iloc[1]
+            why += f" Lineup 2: {r2:.2f}%, keeps {k2:.0f}%, score {s2:.3f}. "
+            if r2 > r1:
+                why += ("Lineup 2 reaches the top more often, but more of the field is expected "
+                        "to play it, so it keeps less of a win.")
+            elif k2 > k1:
+                why += ("Lineup 2 is less likely to be shared, but lineup 1 reaches the top "
+                        "often enough to stay ahead.")
+            else:
+                why += "Lineup 1 is ahead on both counts."
+            p = r1 / 100
+            noise = 2 * ((1 - p) / (p * runs)) ** 0.5 if p > 0 and runs else None
+            gap = (s1 - s2) / s1 if s1 else 0
+            if noise is not None:
+                why += (f" The gap is {gap:.0%}; with {runs:,} simulations, gaps under about "
+                        f"{noise:.0%} are within the sims' noise"
+                        + (", so treat lineups 1 and 2 as about even." if gap < noise else "."))
+            why += (" With several lineups, the sim picks them as a group, each one chosen to "
+                    "finish near the top in slates the others miss, so a lower rank doesn't "
+                    "make a lineup a worse part of the set.")
+        else:
+            why += (f" It had the best rank score of the {note.get('candidates', 0):,} lineups "
+                    "compared.")
+    elif len(wide) > 1:
+        why = ("Lineups are listed in the order the optimizer built them. The simulation is "
+               "off, so there is no rank score; with randomness on, each lineup was built on "
+               "slightly shuffled projections, so the order isn't strictly by points.")
+    wide["Changes from #1"] = wide["#"].map(changes)
+    return wide, why
 
 
 def show_lineup_result(res, top, entries):
@@ -1689,6 +1961,22 @@ if dk_content is not None:
                 with st.expander(f"{len(unprojected_names)} players removed from the pool"):
                     st.dataframe(dropped.sort_values(["Reason", "Position", "Name"]),
                                  width="stretch", hide_index=True)
+
+            # DraftKings never flags players whose game has started (checked on the Week 10
+            # pools), so a slate opened after its first kickoff still offers them.
+            kickoffs = {}
+            for p in players:
+                gi = getattr(p, "game_info", None)
+                if gi is not None and gi.starts_at:
+                    kickoffs[(gi.home_team, gi.away_team)] = gi.starts_at.replace(tzinfo=None)
+            started_games = sum(t <= datetime.now() for t in kickoffs.values())
+            if started_games:
+                st.warning(
+                    f"**{started_games} of {len(kickoffs)} games on this slate have started.** "
+                    "DraftKings no longer takes new lineups for it, and it doesn't mark "
+                    "started players, so a build here can still use them. To late-swap "
+                    "entries you already have, use the Live Contest section at the bottom.",
+                    icon=":material/schedule:")
 
             # Questionable players the board still assumes will play. On the Weeks 3-9
             # NFL main-slate boards 16 of 73 of them sat out (about 1 in 5), against
@@ -2615,7 +2903,17 @@ if dk_content is not None:
                         "players' Max Exp %.")
 
         st.subheader(("4." if is_showdown else "6." if sport == "NFL" else "3.") + " Generate Lineups")
-        if st.button("Generate Lineups"):
+        # Lobby salaries carry 0 season points, so without a projections file every
+        # player is worth 0 and a build would be random. Block it instead.
+        _pts_col = "ppg_projection" if "ppg_projection" in merged_df.columns else "AvgPoints"
+        no_points = (len(merged_df) > 0 and _pts_col in merged_df.columns and not
+                     pd.to_numeric(merged_df[_pts_col], errors="coerce").fillna(0).gt(0).any())
+        if no_points:
+            st.warning("**No projections loaded.** Every player has 0 points, so a build "
+                       "would be random. Upload the "
+                       + ("TwoGunGPT NBA board" if sport == "NBA" else "projections cheatsheet")
+                       + " in section 1 first.")
+        if st.button("Generate Lineups", disabled=no_points):
 
             def configure_optimizer(report=True, solver=None):
                 """A fresh optimizer with every section's settings applied."""
@@ -3139,6 +3437,10 @@ if dk_content is not None:
                 if field_on:
                     sim_df["Total own %"] = [round(sum(lineup_own[c]), 1) for c in chosen]
                     sim_df["Exp. duplicates"] = dupes[chosen].round(2)
+                    sim_df["Keeps %"] = (np.asarray(share)[chosen] * 100).round(0)
+                # The number the lineups are ordered by: top-slice rate x the share of a
+                # finish kept after duplicates (100% with no field).
+                sim_df["Rank score"] = (alone[chosen] * 100).round(3)
                 for i in range(len(mix_report)):
                     mix_report[i]["Lineups"] = sum(1 for c in chosen if batch_of[c] == i)
                 lineups = [lineups[c] for c in chosen]
@@ -3311,7 +3613,35 @@ if dk_content is not None:
                 for pos in order_positions(used_pos, sport):
                     st.metric(pos, used_pos[pos], border=True, width="content")
 
-            st.dataframe(results["lineups"], width="stretch")
+            wide, why = wide_lineups(results["lineups"], results.get("sim"),
+                                     results.get("sim_note"))
+            if why:
+                st.info(why, icon=":material/emoji_events:")
+            st.dataframe(wide, width="stretch", hide_index=True,
+                         column_config={
+                             "#": st.column_config.NumberColumn(pinned=True, width="small"),
+                             "Salary": st.column_config.NumberColumn(format="$%d"),
+                             "Rank score": st.column_config.NumberColumn(
+                                 format="%.3f",
+                                 help="What the lineups are ordered by: top-slice rate × "
+                                      "Keeps %. Expected target-slice finishes per 100 "
+                                      "simulated slates after sharing with duplicates."),
+                             "vs #1": st.column_config.NumberColumn(
+                                 format="%.0f%%", help="Rank score as a share of lineup 1's."),
+                             "Keeps %": st.column_config.NumberColumn(
+                                 format="%.0f%%",
+                                 help="Share of a top finish you keep: 1 ÷ (1 + expected "
+                                      "duplicates in the field)."),
+                             "Opt. pts": st.column_config.NumberColumn(
+                                 format="%.1f", help="The total the optimizer maximized "
+                                                     "(the Optimize on number)."),
+                             "Changes from #1": st.column_config.TextColumn(
+                                 width="medium", help="Up to 3 players different: who comes "
+                                                      "in (+) and who from lineup 1 goes out "
+                                                      "(−). More: how many differ."),
+                         })
+            with st.expander("One row per player (old view)"):
+                st.dataframe(results["lineups"], width="stretch")
 
             if results.get("sim") is not None:
                 note = results["sim_note"]
