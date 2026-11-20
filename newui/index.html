@@ -1,0 +1,727 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DFS Optimizer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega@5.30.0/build/vega.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-lite@5.21.0/build/vega-lite.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-embed@6.26.0/build/vega-embed.min.js"></script>
+<style>
+:root{
+  --bg:#0d1117; --panel:#151b23; --panel2:#1b232e; --line:#26303d; --text:#e6edf3; --muted:#8b98a8;
+  --accent:#3ddc97; --accent2:#4aa8ff; --warn:#f5b84a; --bad:#ff6b6b;
+  --qb:#ff7a59; --rb:#3ddc97; --wr:#4aa8ff; --te:#c792ea; --flex:#f5b84a; --dst:#8b98a8; --cpt:#ffd166;
+  color-scheme: dark;
+}
+*{box-sizing:border-box} html,body{margin:0}
+body{background:var(--bg);color:var(--text);font:14px/1.45 Inter,system-ui,sans-serif}
+a{color:var(--accent2)}
+.num,td.n{font-family:"JetBrains Mono",monospace;font-variant-numeric:tabular-nums}
+.muted{color:var(--muted)}
+main{padding:18px 24px 80px;min-width:0;max-width:1900px;margin:0 auto}
+.top{display:flex;gap:8px;align-items:stretch;flex-wrap:nowrap;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+.sel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:7px 12px;min-width:0;display:flex;flex-direction:column;justify-content:center}
+.sel small{color:var(--muted);font-size:11px;white-space:nowrap}
+.sel select{background:none;border:0;color:var(--text);font:600 14px Inter;padding:0;margin-left:-3px;max-width:280px;cursor:pointer}
+.sel select option{background:var(--panel);color:var(--text)}
+.sel.wide{flex:1 1 0;min-width:160px}
+.top>.sel{flex-shrink:1}
+.top>.sel.fixed{flex:none}
+.top>.sel.fixed select{max-width:none;min-width:64px}
+.top>.sel:not(.wide){max-width:240px}
+.top .sel select{max-width:100%;text-overflow:ellipsis}
+.top .sel .file{overflow:hidden;text-overflow:ellipsis}
+.sel.wide select{max-width:none;width:100%}
+.combo{position:relative;min-width:0}
+.cbin{background:none;border:0;color:var(--text);font:600 14px Inter;padding:0;width:100%;outline:none;text-overflow:ellipsis}
+.cbin::placeholder{color:var(--muted);font-weight:500}
+.set .combo .cbin{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:8px 10px;font-weight:500}
+.set .combo .cbin:focus{outline:2px solid var(--accent);border-color:transparent}
+.cblist{position:absolute;top:calc(100% + 6px);left:-1px;right:-1px;min-width:320px;max-height:380px;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;z-index:40;display:none;box-shadow:0 12px 30px #000a}
+.cblist.on{display:block}
+.cbi{padding:7px 12px;cursor:pointer;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cbi.hl{background:var(--panel2)} .cbi.cur{color:var(--accent)}
+.cbi mark{background:none;color:var(--accent);font-weight:600}
+.cbcount{padding:6px 12px;font-size:11px;color:var(--muted);border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}
+
+.sel .file{font-weight:600;font-size:13.5px;display:flex;gap:8px;align-items:center;white-space:nowrap}
+.sel .file a{font-weight:500;font-size:12px;color:var(--muted);cursor:pointer}
+.btnpair{display:flex;flex-direction:column;gap:5px;justify-content:center;flex:none;white-space:nowrap}
+.btnpair .btn{padding:5px 10px;text-align:center}
+.spacer{flex:1}
+.btn{border:0;border-radius:10px;padding:10px 16px;font:600 13.5px Inter;cursor:pointer;white-space:nowrap;background:var(--panel);color:var(--text);border:1px solid var(--line);text-decoration:none;display:inline-block}
+.btn:hover{border-color:var(--muted)}
+.btn.primary{background:var(--accent);color:#06210f;border-color:var(--accent)}
+.btn.sm{padding:6px 10px;font-size:12px;border-radius:8px;font-weight:500}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.grid{display:grid;grid-template-columns:310px 1fr;gap:16px;align-items:start}
+.grid.collapsed{grid-template-columns:44px 1fr}
+.grid.collapsed aside.card>*:not(.rail){display:none}
+.rail{display:none}
+.grid.collapsed .rail{display:flex;flex-direction:column;align-items:center;gap:10px;padding:10px 0;cursor:pointer}
+.rail span{writing-mode:vertical-rl;transform:rotate(180deg);color:var(--muted);font-size:12px;font-weight:600;letter-spacing:.06em}
+.collapse{border:1px solid var(--line);background:var(--panel2);color:var(--muted);border-radius:7px;width:26px;height:24px;cursor:pointer;font-size:13px;line-height:1}
+.collapse:hover{color:var(--text)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px}
+.card>h3{margin:0;padding:12px 16px;font-size:13px;font-weight:600;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:8px}
+.card>h3 span{color:var(--muted);font-weight:500;font-size:12px}
+aside.card{position:sticky;top:12px;max-height:calc(100vh - 24px);overflow:auto}
+.grp{padding:4px 16px 10px;border-bottom:1px solid var(--line)}
+.grp:last-child{border-bottom:0}
+.grp>h4{margin:12px 0 2px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600}
+.set{padding:6px 0;min-width:0}
+.set>label,.lab{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;color:var(--muted);margin-bottom:5px;gap:8px}
+.set>label b{color:var(--text);font-weight:600}
+.hint{font-size:12px;color:var(--muted);margin:3px 0}
+.hint p{margin:0}
+.hint strong{color:var(--text)}
+.help{display:inline-grid;place-items:center;width:15px;height:15px;border-radius:50%;border:1px solid var(--line);font-size:10px;color:var(--muted);cursor:help;flex:none}
+.numin,.txt,select.in{width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:9px;padding:8px 10px;font-size:14px;font-family:inherit}
+.numin{font-family:"JetBrains Mono",monospace}
+.numin:focus,.txt:focus,select.in:focus{outline:2px solid var(--accent);border-color:transparent}
+.cell{width:78px;padding:4px 6px;font-size:12px;border-radius:6px}
+select.cell{width:auto}
+input[type=range]{width:100%;accent-color:var(--accent)}
+input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px;cursor:pointer}
+.seg{display:flex;background:var(--panel2);border-radius:9px;padding:3px;gap:3px;flex-wrap:wrap}
+.seg button{flex:1;border:0;background:none;color:var(--muted);padding:6px 8px;border-radius:7px;font:500 12px Inter;cursor:pointer;white-space:nowrap}
+.seg button.on{background:var(--panel);color:var(--text);box-shadow:0 1px 2px #0005}
+.pills{display:flex;gap:6px;flex-wrap:wrap}
+.pills button{border:1px solid var(--line);background:var(--panel2);color:var(--muted);padding:5px 11px;border-radius:20px;font:500 12px Inter;cursor:pointer}
+.pills button.on{border-color:var(--accent);color:var(--text);background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px}
+.chip{display:inline-flex;gap:6px;align-items:center;padding:3px 9px;border-radius:14px;background:var(--panel2);border:1px solid var(--line);font-size:12px}
+.chip b{cursor:pointer;color:var(--muted);font-weight:500}
+.sw{display:flex;justify-content:space-between;align-items:center;font-size:13px;padding:6px 0;gap:10px}
+.tog{flex:none;width:34px;height:20px;border-radius:20px;background:var(--line);position:relative;cursor:pointer;border:0}
+.tog.on{background:var(--accent)}
+.tog::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:.15s}
+.tog.on::after{left:16px}
+.steps{display:flex;gap:4px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
+.steps button.step{border:1px solid var(--line);background:var(--panel);color:var(--muted);padding:8px 14px;border-radius:10px;font:500 13px Inter;cursor:pointer;display:flex;gap:8px;align-items:center}
+.steps button.step em{font-style:normal;display:inline-grid;place-items:center;width:20px;height:20px;border-radius:6px;background:var(--panel2);font-size:11px}
+.steps button.step.on{color:var(--text);border-color:var(--accent)}
+.steps button.step.on em{background:var(--accent);color:#06210f}
+.steps .gen{margin-left:6px;padding:9px 18px}
+.stack>*+*{margin-top:16px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:16px;align-items:start}
+.kpis{display:flex;gap:12px;flex-wrap:wrap}
+.kpi{padding:11px 16px;min-width:120px;flex:1}
+.kpi small{color:var(--muted);font-size:12px;display:flex;gap:6px;align-items:center}
+.kpi div{font-size:21px;font-weight:600;margin-top:2px;font-family:"JetBrains Mono",monospace}
+.kpi i{font-style:normal;font-size:12px;color:var(--accent)}
+.note{padding:11px 14px;border-left:3px solid var(--accent2);border-radius:10px;background:var(--panel);border-top:1px solid var(--line);border-right:1px solid var(--line);border-bottom:1px solid var(--line);margin:6px 0}
+.note.warning{border-left-color:var(--warn)} .note.error{border-left-color:var(--bad)} .note.success{border-left-color:var(--accent)}
+.note p{margin:0 0 4px;color:var(--muted)} .note p:last-child{margin:0} .note strong{color:var(--text)}
+.note ul{margin:4px 0;padding-left:18px;color:var(--muted)}
+.md p{margin:6px 0} .md strong{color:var(--text)} .md ul{margin:4px 0;padding-left:20px}
+h4.sub{margin:14px 0 6px;font-size:13px}
+.tabs{display:flex;gap:2px;padding:6px 10px 0;border-bottom:1px solid var(--line);flex-wrap:wrap;align-items:center}
+.tabs button.tab{border:0;background:none;color:var(--muted);padding:9px 11px;font:500 13px Inter;cursor:pointer;border-bottom:2px solid transparent}
+.tabs button.tab.on{color:var(--text);border-color:var(--accent)}
+.body{padding:12px 16px}
+.toolbar{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap}
+.frow{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.frow>.fcol{flex:1 1 0;min-width:180px}
+.frow>.set{flex:0 1 auto}
+.frow.btns{align-items:center}
+.scroll{overflow:auto;max-height:620px;border:1px solid var(--line);border-radius:10px;margin:6px 0}
+table{border-collapse:collapse;width:100%;font-size:12.5px}
+th{position:sticky;top:0;background:var(--panel);color:var(--muted);font-weight:500;text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap;z-index:1}
+td{padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+tr:hover td{background:var(--panel2)}
+tr.first td{background:color-mix(in srgb,var(--accent) 8%,transparent)}
+tr.locked td{background:color-mix(in srgb,var(--accent) 7%,transparent)}
+tr.excl td{opacity:.45}
+.p{display:inline-flex;align-items:center;gap:6px}
+.p::before{content:"";width:3px;height:14px;border-radius:2px;background:var(--c)}
+.p.diff{font-weight:600}.p.same{color:var(--muted)}
+.rank{display:inline-grid;place-items:center;min-width:24px;height:24px;border-radius:7px;background:var(--panel2);font-weight:600;padding:0 4px}
+tr.first .rank{background:var(--accent);color:#06210f}
+.bar{height:6px;border-radius:6px;background:var(--panel2);width:70px;overflow:hidden;display:inline-block;vertical-align:middle;margin-right:8px}
+.bar i{display:block;height:100%;background:var(--accent)}
+.bar.own i{background:var(--accent2)}
+.infobtn{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:50%;border:1px solid var(--accent2);color:var(--accent2);font:600 12px Inter;cursor:pointer;background:none;padding:0}
+.infobtn.on{background:var(--accent2);color:#0d1117}
+.dict{margin:8px 0 10px;padding:4px 16px 10px;border:1px solid var(--line);border-left:3px solid var(--accent2);border-radius:10px;background:var(--panel2)}
+.dict dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;margin:8px 0 0}
+.dict dt{font-weight:600;white-space:nowrap}
+.dict dd{margin:0;color:var(--muted)}
+.dict h5{margin:10px 0 0;font-size:13px}
+.pe{width:62px;background:transparent;border:1px solid transparent;border-radius:6px;color:var(--text);font:12.5px "JetBrains Mono",monospace;padding:3px 5px;text-align:right}
+.pe:hover{border-color:var(--line)} .pe:focus{outline:none;border-color:var(--accent);background:var(--panel2)}
+.pe.ed{color:var(--warn);font-weight:600;background:color-mix(in srgb,var(--warn) 12%,transparent)}
+.tag{display:inline-block;padding:1px 6px;border-radius:5px;font-size:10.5px;font-weight:600;background:color-mix(in srgb,var(--warn) 20%,transparent);color:var(--warn);margin-left:6px}
+.set>label.drop{display:block}
+.drop{border:1.5px dashed var(--line);border-radius:12px;padding:14px;text-align:center;color:var(--muted);cursor:pointer;display:block}
+.drop:hover{border-color:var(--accent)}
+.drop b{color:var(--text)}
+.drop input{display:none}
+details{border:1px solid var(--line);border-radius:10px;margin:8px 0;background:var(--panel)}
+details>summary{padding:10px 14px;cursor:pointer;font-weight:500;font-size:13px}
+details>div{padding:0 14px 12px}
+pre{background:var(--panel2);padding:10px;border-radius:8px;overflow:auto;font-size:12px}
+hr{border:0;border-top:1px solid var(--line);margin:12px 0}
+.empty{padding:40px;text-align:center;color:var(--muted)}
+.chart{width:100%;min-height:120px}
+#busy{position:fixed;inset:0;background:#0d1117cc;display:none;place-items:center;z-index:50}
+#busy.on{display:grid}
+#busy .card{padding:26px 34px;text-align:center;min-width:300px}
+#busy .t{font-size:30px;font-weight:600;font-family:"JetBrains Mono",monospace;margin-top:6px}
+.spin{width:28px;height:28px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:sp 1s linear infinite;margin:0 auto 10px}
+@keyframes sp{to{transform:rotate(360deg)}}
+#toast{position:fixed;right:18px;bottom:18px;max-width:520px;z-index:60;display:none}
+#toast.on{display:block}
+#loading{padding:80px;text-align:center;color:var(--muted)}
+.dim{opacity:.55;pointer-events:none}
+@media (max-width:1150px){.grid{grid-template-columns:1fr} aside.card{position:static;max-height:none}.cards{grid-template-columns:1fr}}
+@media (max-width:1100px){.top{flex-wrap:wrap}}
+@media (max-width:760px){main{padding:14px}}
+</style>
+</head>
+<body>
+<main>
+  <div class="top" id="top"></div>
+  <div id="loading"><div class="spin"></div>Starting the optimizer…</div>
+  <div class="grid" id="grid" style="display:none">
+    <aside class="card" id="settings"></aside>
+    <div style="min-width:0">
+      <div class="steps" id="steps"></div>
+      <div id="page"></div>
+    </div>
+  </div>
+</main>
+<div id="busy"><div class="card"><div class="spin"></div><div id="busy-what">Working</div><div class="t" id="busy-t">0:00</div><div class="hint">Builds keep running if you close this tab.</div></div></div>
+<div id="toast" class="note error"></div>
+<script>
+"use strict";
+let S = null;                 // latest app state from the server
+let step = (location.hash.slice(1) || "pool"), resTab = null, openDet = new Set(), tabSel = {};
+const consumed = new Set();
+let collapsed = false; try { collapsed = localStorage.getItem("settingsCollapsed") === "1"; } catch(e) {}
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const md = s => { try { return marked.parse(String(s ?? "")); } catch(e) { return esc(s); } };
+const mdi = s => { try { return marked.parseInline(String(s ?? "")); } catch(e) { return esc(s); } };
+const clean = s => String(s ?? "").replace(/^[\p{Extended_Pictographic}️\s]+/u, "").replace(/:material\/[a-z_]+:\s*/g, "");
+const helpI = h => h ? `<span class="help" title="${esc(h.replace(/\*\*/g,""))}">?</span>` : "";
+const POS = {QB:"--qb",RB:"--rb",RB1:"--rb",RB2:"--rb",WR:"--wr",WR1:"--wr",WR2:"--wr",WR3:"--wr",TE:"--te",FLEX:"--flex",FLEX1:"--flex",FLEX2:"--flex",FLEX3:"--flex",FLEX4:"--flex",FLEX5:"--flex",DST:"--dst",CPT:"--cpt",UTIL:"--flex",PG:"--qb",SG:"--rb",SF:"--wr",PF:"--te",C:"--dst",G:"--flex",F:"--flex"};
+
+// ---------------- server ----------------
+async function api(body) {
+  try {
+    const r = await fetch("/api/act", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+    const j = await r.json();
+    if (j.error) { toast(j.error); return; }
+    if (j.busy) { showBusy(j); return poll(); }
+    S = j; render();
+  } catch(e) { toast("Lost contact with the optimizer server: " + e); }
+}
+async function load() {
+  try { const r = await fetch("/api/state"); const j = await r.json();
+    if (j.error) { toast(j.error); return; }
+    if (j.busy) { showBusy(j); return poll(); }
+    S = j; render();
+  } catch(e) { $("#loading").textContent = "Can't reach the optimizer server. Is it running?"; }
+}
+let pollT = null, busyT = null, busyStart = 0, clockSkew = 0;
+function showBusy(j) {
+  $("#busy").classList.add("on");
+  $("#busy-what").textContent = j.busy.what || "Working";
+  clockSkew = (j.now || Date.now()/1000) - Date.now()/1000;
+  busyStart = j.busy.since;
+  clearInterval(busyT);
+  const tick = () => { const s = Math.max(0, Math.floor(Date.now()/1000 + clockSkew - busyStart));
+    $("#busy-t").textContent = Math.floor(s/60) + ":" + String(s%60).padStart(2,"0"); };
+  tick(); busyT = setInterval(tick, 1000);
+}
+function poll() {
+  clearTimeout(pollT);
+  pollT = setTimeout(async () => {
+    const r = await fetch("/api/state"); const j = await r.json();
+    if (j.busy) { showBusy(j); poll(); return; }
+    clearInterval(busyT); $("#busy").classList.remove("on");
+    if (j.error) toast(j.error);
+    S = j; render();
+  }, 1500);
+}
+function toast(msg) { const t = $("#toast"); t.innerHTML = `<p><strong>Something went wrong</strong></p><p>${esc(msg)}</p>`; t.classList.add("on"); setTimeout(() => t.classList.remove("on"), 9000); }
+const LONG = /^(Generate Lineups|Simulate lineup|Calculate Optimal|Check DraftKings injury news|Recheck injuries)/i;
+const set = (id, value) => api({op:"set", id, value});
+const click = (id, label) => api({op:"click", id, long: LONG.test(clean(label)), what: /Generate/i.test(label) ? "Building lineups" : clean(label)});
+
+// ---------------- tree helpers ----------------
+function walk(ns, f) { for (const n of ns || []) { f(n); if (n.children) walk(n.children, f); } }
+function find(ns, pred) { let r = null; walk(ns, n => { if (!r && pred(n)) r = n; }); return r; }
+const W = (ns, w, label) => find(ns, n => n.t === "widget" && n.w === w && (label instanceof RegExp ? label.test(n.label) : n.label === label));
+
+// ---------------- generic rendering ----------------
+function R(n, ctx = {}) {
+  if (!n || consumed.has(n)) return "";
+  switch (n.t) {
+    case "heading": return n.level === 1 ? "" : `<h4 class="sub">${mdi(clean(n.text))}</h4>`;
+    case "caption": return `<div class="hint">${md(n.text)}</div>`;
+    case "md": return `<div class="md">${md(n.text)}</div>`;
+    case "code": return `<pre>${esc(n.text)}</pre>`;
+    case "divider": return "<hr>";
+    case "alert": return `<div class="note ${n.kind}">${md(n.text)}</div>`;
+    case "metric": return `<div class="card kpi"><small>${esc(n.label)} ${helpI(n.help)}</small><div>${esc(n.value)}</div>${n.delta ? `<i>${esc(n.delta)}</i>` : ""}</div>`;
+    case "table": return table(n);
+    case "chart": { const id = "c" + Math.random().toString(36).slice(2); charts.push([id, n.spec]); return `<div class="chart" id="${id}"></div>`; }
+    case "link": return `<a class="btn sm" href="${esc(n.url)}" target="_blank" rel="noopener" title="${esc(n.help)}">${esc(clean(n.label))} ↗</a>`;
+    case "widget": return widget(n, ctx);
+    case "block": return block(n, ctx);
+  }
+  return "";
+}
+const Rs = (ns, ctx) => (ns || []).map(n => R(n, ctx)).join("");
+
+function block(n, ctx) {
+  const inner = () => Rs(n.children, ctx);
+  if (n.kind === "expander" || n.kind === "status") {
+    const k = n.label; const open = openDet.has(k) || (n.expanded && !openDet.has("!" + k));
+    return `<details data-det="${esc(k)}" ${open ? "open" : ""}><summary>${mdi(clean(n.label))}</summary><div>${inner()}</div></details>`;
+  }
+  if (n.kind === "tab_container") {
+    const labels = n.children.map(c => c.label); const key = labels.join("|"); const cur = tabSel[key] ?? 0;
+    return `<div class="card"><div class="tabs">${labels.map((l,i) => `<button class="tab ${i===cur?"on":""}" data-tabsel="${esc(key)}" data-i="${i}">${mdi(clean(l))}</button>`).join("")}</div><div class="body">${Rs(n.children[cur]?.children, ctx)}</div></div>`;
+  }
+  if (n.kind === "flex_container" && n.dir === "row") {
+    const allBtns = n.children.every(c => c.t === "widget" && /Button/.test(c.w) || c.t === "link" || c.t === "caption");
+    return `<div class="frow ${allBtns ? "btns" : ""}">${n.children.map(c => c.kind === "column" ? `<div class="fcol" style="flex-grow:${c.weight||1}">${Rs(c.children, ctx)}</div>` : R(c, ctx)).join("")}</div>`;
+  }
+  if (n.kind === "column") return `<div class="fcol">${inner()}</div>`;
+  return `<div>${inner()}</div>`;
+}
+
+function widget(n, ctx) {
+  const L = clean(n.label), dis = n.disabled ? "disabled" : "";
+  const lab = `<label>${mdi(L)} ${helpI(n.help)}</label>`;
+  switch (n.w) {
+    case "Selectbox": {
+      if (n.options.length > 20) return `<div class="set">${lab}${comboBox(n)}</div>`;
+      const opts = (n.index == null ? `<option value="" selected>${esc(n.placeholder || "Choose…")}</option>` : "") +
+        n.options.map((o,i) => `<option value="${i}" ${i===n.index?"selected":""}>${esc(o)}</option>`).join("");
+      return `<div class="set">${lab}<select class="in" data-sel="${esc(n.id)}" ${dis}>${opts}</select></div>`;
+    }
+    case "Radio": case "SelectSlider":
+      if (n.options.length <= 6) return `<div class="set">${lab}<div class="seg">${n.options.map((o,i) => `<button class="${i===n.index?"on":""}" data-pick="${esc(n.id)}" data-i="${i}" ${dis}>${esc(shortOpt(o))}</button>`).join("")}</div></div>`;
+      return `<div class="set">${lab}<select class="in" data-sel="${esc(n.id)}" ${dis}>${n.options.map((o,i) => `<option value="${i}" ${i===n.index?"selected":""}>${esc(o)}</option>`).join("")}</select></div>`;
+    case "ButtonGroup": {
+      const on = new Set(n.index);
+      const cls = n.style === "pills" ? "pills" : "seg";
+      return `<div class="set">${lab}<div class="${cls}">${n.options.map((o,i) => `<button class="${on.has(i)?"on":""}" data-bg="${esc(n.id)}" data-i="${i}" data-single="${n.single?1:0}" ${dis}>${esc(clean(o))}</button>`).join("")}</div></div>`;
+    }
+    case "Multiselect": {
+      const on = new Set(n.index);
+      if (n.options.length <= 14) return `<div class="set">${lab}<div class="pills">${n.options.map((o,i) => `<button class="${on.has(i)?"on":""}" data-ms="${esc(n.id)}" data-i="${i}" ${dis}>${esc(o)}</button>`).join("")}</div></div>`;
+      return `<div class="set">${lab}<div class="chips">${[...on].map(i => `<span class="chip">${esc(n.options[i])}<b data-msdel="${esc(n.id)}" data-i="${i}">✕</b></span>`).join("")}</div>
+        <select class="in" data-msadd="${esc(n.id)}" ${dis}><option value="">Add…</option>${n.options.map((o,i) => on.has(i) ? "" : `<option value="${i}">${esc(o)}</option>`).join("")}</select></div>`;
+    }
+    case "NumberInput":
+      return `<div class="set">${lab}<input class="numin" type="number" data-num="${esc(n.id)}" value="${n.value ?? ""}" ${n.min!=null?`min="${n.min}"`:""} ${n.max!=null?`max="${n.max}"`:""} step="${n.step || "any"}" ${dis}></div>`;
+    case "Slider":
+      return `<div class="set"><label>${mdi(L)} <b class="num" id="sv-${esc(n.id)}">${n.value}</b></label><input type="range" data-slide="${esc(n.id)}" min="${n.min}" max="${n.max}" step="${n.step}" value="${n.value}" ${dis}></div>`;
+    case "Toggle": case "Checkbox":
+      return `<div class="sw"><span>${mdi(L)} ${helpI(n.help)}</span><button class="tog ${n.value?"on":""}" data-tog="${esc(n.id)}" data-v="${n.value?1:0}" ${dis}></button></div>`;
+    case "TextInput": case "TextArea":
+      return `<div class="set">${lab}<input class="txt" ${n.password?'type="password"':""} data-txt="${esc(n.id)}" value="${esc(n.value)}" placeholder="${esc(n.placeholder)}" ${dis}></div>`;
+    case "TimeInput":
+      return `<div class="set">${lab}<input class="numin" type="time" data-txt="${esc(n.id)}" value="${esc(n.value)}" step="${n.step || 900}" ${dis}></div>`;
+    case "DateInput":
+      return `<div class="set">${lab}<input class="numin" type="date" data-txt="${esc(n.id)}" value="${esc(n.value)}" ${dis}></div>`;
+    case "ChatInput":
+      return `<div class="frow"><input class="txt" style="flex:1" data-chat="${esc(n.id)}" placeholder="${esc(n.placeholder || "Ask…")}"><button class="btn primary sm" data-chatgo="${esc(n.id)}">Send</button></div>`;
+    case "Button":
+      return `<button class="btn sm ${n.primary?"primary":""}" data-click="${esc(n.id)}" data-label="${esc(n.label)}" title="${esc(n.help)}" ${dis}>${esc(clean(n.label))}</button>`;
+    case "DownloadButton":
+      return `<a class="btn sm primary" href="/api/media?url=${encodeURIComponent(n.url)}" title="${esc(n.help)}">${esc(clean(n.label))} ↓</a>`;
+    case "FileUploader":
+      return `<div class="set">${lab}<label class="drop">${n.file ? `<b>${esc(n.file)}</b> · <span data-clear="${esc(n.id)}">remove</span>` : `<b>Choose file</b> or drop it here`}<br><span class="hint">${(n.types||[]).join(", ")}</span><input type="file" data-up="${esc(n.id)}" ${n.types?.length?`accept="${n.types.join(",")}"`:""}></label></div>`;
+  }
+  return `<div class="hint">(${esc(n.w)}: ${esc(L)})</div>`;
+}
+const shortOpt = o => String(o).replace(/^top /, "").replace(/^(\d+)000$/, "$1k").replace(/^2500$/, "2.5k").replace(/^(\d+),000$/, "$1k");
+
+// ---------------- tables ----------------
+function fmtVal(v, cfg) {
+  if (v == null || v === "") return "";
+  const f = cfg?.type_config?.format;
+  if (typeof v === "number") {
+    if (f && f.includes("%")) {
+      const m = f.match(/^(.*?)%([+]?)(?:\.(\d+))?([df])(.*)$/);
+      if (m) { const dec = m[4] === "d" ? 0 : +(m[3] ?? 2); let s = Number(v).toLocaleString(undefined, {minimumFractionDigits:dec, maximumFractionDigits:dec});
+        if (m[2] && v > 0) s = "+" + s; return m[1] + s + m[5].replace("%%", "%"); }
+    }
+    if (Number.isInteger(v)) return v.toLocaleString();
+    return v.toLocaleString(undefined, {maximumFractionDigits: Math.abs(v) < 10 ? 2 : 1});
+  }
+  if (typeof v === "boolean") return v ? "✓" : "";
+  if (Array.isArray(v)) return v.join(", ");
+  return String(v);
+}
+const BAR = /^(Exposure %|Proj own %|% of lineups|Actual %|vs #1|Share %)$/;
+function table(n) {
+  const cfg = n.config || {};
+  const vis = n.cols.map((c,i) => [c,i]).filter(([c]) => !(c in cfg && (cfg[c] === null || cfg[c]?.hidden)) && c !== "_index");
+  const label = c => clean(cfg[c]?.label || c);
+  if (n.key && n.key.startsWith("player_editor")) return poolTable(n, vis, cfg);
+  if (n.edit > 0) return editTable(n, vis, cfg);
+  if (n.cols.includes("#") && (n.cols.includes("QB") || n.cols.includes("CPT") || n.cols.includes("PG"))) return lineupTable(n, vis, cfg);
+  if (!n.rows.length) return `<div class="hint">No rows.</div>`;
+  const head = vis.map(([c]) => `<th title="${esc(cfg[c]?.help || "")}">${esc(label(c))}</th>`).join("");
+  const body = n.rows.map(r => "<tr>" + vis.map(([c,i]) => {
+    const v = r[i];
+    if (BAR.test(c) && typeof v === "number") return `<td class="n"><span class="bar ${/own/i.test(c)?"own":""}"><i style="width:${Math.max(0,Math.min(v,100))}%"></i></span>${fmtVal(v,cfg[c])}${/%/.test(c)&&!(cfg[c]?.type_config?.format)?"%":""}</td>`;
+    return `<td class="${typeof v === "number" ? "n" : ""}">${posName(c, v, cfg[c])}</td>`;
+  }).join("") + "</tr>").join("");
+  return `<div class="scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>${n.total > n.rows.length ? `<div class="hint">Showing ${n.rows.length} of ${n.total}.</div>` : ""}`;
+}
+const posName = (c, v, cfg) => (c === "Position" && POS[v]) ? `<span class="p" style="--c:var(${POS[v]})">${esc(v)}</span>` : esc(fmtVal(v, cfg));
+
+function lineupTable(n, vis, cfg) {
+  vis = vis.filter(([c]) => c !== "Changes from #1");   // bold names already show what changed
+  const slots = vis.filter(([c]) => POS[c.replace(/\d+$/,"")] || POS[c]);
+  const slotIdx = new Set(slots.map(([,i]) => i));
+  const first = new Set(slots.map(([,i]) => n.rows[0]?.[i]));
+  const head = vis.map(([c]) => `<th title="${esc(cfg[c]?.help || "")}">${esc(clean(cfg[c]?.label || c))}</th>`).join("");
+  const body = n.rows.map((r, k) => `<tr class="${k?"":"first"}">` + vis.map(([c,i]) => {
+    const v = r[i];
+    if (c === "#") return `<td><span class="rank num">${esc(v)}</span></td>`;
+    if (slotIdx.has(i)) { const base = POS[c] || POS[c.replace(/\d+$/,"")]; return `<td><span class="p ${k ? (first.has(v) ? "same" : "diff") : ""}" style="--c:var(${base})">${esc(v)}</span></td>`; }
+    if (c === "vs #1" && typeof v === "number") return `<td class="n"><span class="bar"><i style="width:${Math.min(v,100)}%"></i></span>${fmtVal(v,cfg[c])}</td>`;
+    return `<td class="${typeof v === "number" ? "n" : ""}">${esc(fmtVal(v, cfg[c]))}</td>`;
+  }).join("") + "</tr>").join("");
+  const hasDict = vis.some(([c]) => colDef(c));
+  return `<div class="hint" style="display:flex;gap:14px;flex-wrap:wrap;margin:6px 0;align-items:center">${hasDict ? `<button class="infobtn ${showDict ? "on" : ""}" data-dict="1" title="What the columns mean">i</button>` : ""}${["CPT","QB","RB","WR","TE","FLEX","UTIL","DST","PG","SG","SF","PF","C","G","F"].filter(p => slots.some(([c]) => c.replace(/\d+$/, "") === p)).map(p => `<span class="p" style="--c:var(${POS[p]})">${p}</span>`).join("")}<span>Bold = different from lineup 1</span></div>
+    ${showDict ? dictPanel(vis.map(([c]) => c)) : ""}
+    <div class="scroll" style="max-height:680px"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function poolTable(n, vis, cfg) {
+  const P = S.proj;
+  const ci = c => n.cols.indexOf(c);
+  const iL = ci("Lock"), iE = ci("Exclude"), iMin = ci("Min Exp %"), iMax = ci("Max Exp %"), iN = ci("Name"), iQ = ci("injury_status");
+  const front = ["Lock","Exclude"], back = ["Min Exp %","Max Exp %"];
+  const mid = vis.filter(([c]) => !front.includes(c) && !back.includes(c) && c !== "injury_status" && c !== "ppg_projection");
+  const head = `<th>Lock</th><th>Excl.</th>` + mid.map(([c]) => `<th title="${esc(cfg[c]?.help || "")}">${esc(clean(cfg[c]?.label || c))}</th>`).join("") + `<th title="${esc(cfg["Min Exp %"]?.help||"")}">Min %</th><th title="${esc(cfg["Max Exp %"]?.help||"")}">Max %</th>`;
+  const body = n.rows.map(r => {
+    const name = r[iN];
+    return `<tr class="${r[iL]?"locked":""} ${r[iE]?"excl":""}"><td><input type="checkbox" data-pool="lock" data-name="${esc(name)}" ${r[iL]?"checked":""}></td><td><input type="checkbox" data-pool="exclude" data-name="${esc(name)}" ${r[iE]?"checked":""}></td>` +
+      mid.map(([c,i]) => { const v = r[i];
+        if (c === "Name") return `<td>${esc(v)}${iQ >= 0 && r[iQ] ? `<span class="tag">${esc(r[iQ])}</span>` : ""}</td>`;
+        if (c === "Position") return `<td>${String(v).split("/").map(p => POS[p] ? `<span class="p" style="--c:var(${POS[p]})">${esc(p)}</span>` : esc(p)).join(" ")}</td>`;
+        if (c === "Salary") return `<td class="n">$${fmtVal(v)}</td>`;
+        if (P && P.cols.includes(c)) { const k = nameKey(name), ed = P.edits[k]?.[c] != null, was = P.orig[k]?.[c];
+          return `<td><input class="pe ${ed ? "ed" : ""}" type="number" step="0.1" data-proj="${esc(c)}" data-name="${esc(name)}" value="${v == null ? "" : Math.round(v * 100) / 100}" title="${ed ? `Edited · file says ${was}. Clear the box to go back.` : "Type a new number to override the file"}"></td>`; }
+        return `<td class="${typeof v==="number"?"n":""}">${esc(fmtVal(v, cfg[c]))}</td>`; }).join("") +
+      `<td><input class="numin cell" type="number" min="0" max="100" step="5" data-pool="min" data-name="${esc(name)}" value="${r[iMin] ?? ""}" placeholder="–"></td>` +
+      `<td><input class="numin cell" type="number" min="0" max="100" step="5" data-pool="max" data-name="${esc(name)}" value="${r[iMax] ?? ""}" placeholder="–"></td></tr>`;
+  }).join("");
+  const nEd = P ? Object.keys(P.edits).length : 0;
+  const banner = P ? `<div class="hint" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:6px 0">
+      <span>Click any ${P.cols.filter(c => n.cols.includes(c)).map(c => clean(cfg[c]?.label || c)).join(" / ")} number to change it. Changing <b>Projection</b> moves that player's Median, Ceiling and Nuke by the same percentage, so the build and the sim both use it.</span>
+      ${nEd ? `<span class="tag" style="margin:0">${nEd} player${nEd > 1 ? "s" : ""} edited</span><button class="btn sm" data-projreset="1">Undo all edits</button>` : ""}</div>` : "";
+  return `${banner}<div class="scroll" style="max-height:640px"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+const SUFFIX = new Set(["jr","sr","ii","iii","iv","v"]);
+const nameKey = s => String(s).toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(w => w && !SUFFIX.has(w)).join(" ");
+
+function editTable(n, vis, cfg) {
+  const tid = "t" + Math.random().toString(36).slice(2);
+  editTables[tid] = n;
+  const cell = (c, v, r) => {
+    const tc = cfg[c]?.type_config || {};
+    const a = `data-et="${tid}" data-r="${r}" data-c="${esc(c)}"`;
+    if (tc.type === "selectbox") return `<select class="in cell" ${a}>${(tc.options || []).map(o => { const ov = typeof o === "object" ? o.value : o; return `<option ${String(ov)===String(v)?"selected":""}>${esc(ov)}</option>`; }).join("")}</select>`;
+    if (tc.type === "checkbox") return `<input type="checkbox" ${a} ${v?"checked":""}>`;
+    if (tc.type === "multiselect") { const opts = (tc.options || []).map(o => typeof o === "object" ? o.value : o); const cur = v || [];
+      return `<div class="chips" style="margin:0">${cur.map((x,j) => `<span class="chip">${esc(x)}<b data-etdel="${tid}" data-r="${r}" data-c="${esc(c)}" data-j="${j}">✕</b></span>`).join("")}
+        <select class="in cell" data-etadd="${tid}" data-r="${r}" data-c="${esc(c)}" style="max-width:200px"><option value="">Add player…</option>${opts.filter(o => !cur.includes(o)).map(o => `<option>${esc(o)}</option>`).join("")}</select></div>`; }
+    if (tc.type === "number" || typeof v === "number") return `<input class="numin cell" type="number" ${a} value="${v ?? ""}" ${tc.min_value!=null?`min="${tc.min_value}"`:""} ${tc.max_value!=null?`max="${tc.max_value}"`:""} step="${tc.step || "any"}">`;
+    return `<input class="txt cell" ${a} value="${esc(v ?? "")}">`;
+  };
+  const head = vis.map(([c]) => `<th title="${esc(cfg[c]?.help || "")}">${esc(clean(cfg[c]?.label || c))}</th>`).join("") + (n.edit === 2 ? "<th></th>" : "");
+  const isCombo = n.key.startsWith("combo_editor");
+  const allRows = isCombo && pendingCombo ? [...n.rows, n.cols.map(c => pendingCombo[c])] : n.rows;
+  const body = allRows.map((r, k) => "<tr>" + vis.map(([c,i]) => `<td>${cell(c, r[i], k)}</td>`).join("") + (n.edit === 2 ? `<td><button class="btn sm" data-etrm="${tid}" data-r="${k}">✕</button></td>` : "") + "</tr>").join("");
+  return `<div class="scroll" style="max-height:400px;display:inline-block;max-width:100%"><table style="width:auto"><thead><tr>${head}</tr></thead><tbody>${body || `<tr><td colspan="${vis.length+1}" class="muted">No rows yet</td></tr>`}</tbody></table></div>${isCombo && pendingCombo ? `<div class="hint">Add at least two players to the new row to save it.</div>` : ""}
+    ${n.edit === 2 ? `<div><button class="btn sm" data-etnew="${tid}">+ Add row</button></div>` : ""}`;
+}
+function etRows(n) { return n.rows.map(r => Object.fromEntries(n.cols.map((c,i) => [c, r[i]]))); }
+function etSend(n, rows) { api({op:"table", key:n.key, rows}); }
+
+
+// ---------------- column guide for the lineups table ----------------
+let showDict = false;
+function colDef(c) {
+  const m = c.match(/^Top ([\d.]+%) rate$/);
+  if (m) return `How often this lineup finishes in the top ${m[1]} of the simulated contest: the share of simulated slates where it outscores all but ${m[1]} of a simulated opponent field built from projected ownership. Higher is better.`;
+  return ({
+    "Opt. pts": "The total the optimizer maximized for this lineup: its points on the number chosen under Optimize on (Projection, Median, Ceiling or Nuke) on the Player pool page.",
+    "Rank score": "What the lineups are sorted by: the top-finish rate × Keeps %. Roughly, top finishes per 100 simulated slates after sharing them with expected duplicates. Higher is better.",
+    "vs #1": "Rank score as a share of lineup 1's. 90% means this lineup's rank score is 90% of the top lineup's.",
+    "Keeps %": "How much of a top finish you'd keep after duplicates: 1 ÷ (1 + expected duplicates). 100% means nobody else is expected to have this exact lineup.",
+    "Exp. duplicates": "How many other entries in a field this size are expected to have this exact lineup, from projected ownership. 0.02 means about a 2% chance of one duplicate.",
+    "Total own %": "The players' projected ownership added together. Lower means a more contrarian lineup; higher means more chalk.",
+    "Sim avg": "The lineup's average score across all the simulated slates.",
+    "Sim 99th": "The lineup's ceiling: the score it reaches or beats in only 1% of simulated slates.",
+    "Sim 90th": "The score it reaches or beats in 10% of simulated slates.",
+  })[c] || null;
+}
+function dictPanel(cols) {
+  const after = cols.slice(cols.indexOf("Salary") + 1);
+  const rows = after.map(c => [c, colDef(c)]).filter(([, d]) => d);
+  if (!rows.length) return "";
+  return `<div class="dict"><h5>What the columns mean</h5><dl>${rows.map(([c, d]) => `<dt>${esc(c)}</dt><dd>${esc(d)}</dd>`).join("")}</dl>
+    <div class="hint" style="margin-top:8px">All sim numbers come from the simulation that picked the lineups (Settings → Simulation).</div></div>`;
+}
+// ---------------- page layout ----------------
+let charts = [], editTables = {};
+const PAGES = [["pool","1","Player pool"],["rules","2","Rules & stacks"],["res","3","Results"],["lb","4","Lineup builder"],["live","5","Live contest"],["ai","✦","Assistant"]];
+const RESULT_HEADS = /^(Generated Lineups|Simulation|Stack Mix|Player Combos|Exposure Summary|Captain Exposure|Common Combos|Team Exposure|Captain Breakdown|Flex Breakdown|.*Breakdown)$/;
+
+function sections(main) {
+  const out = []; let cur = {title: "", nodes: []};
+  for (const n of main) {
+    if (n.t === "heading" && n.level === 1) continue;
+    if (n.t === "heading" && n.level <= 3) { out.push(cur); cur = {title: clean(n.text), nodes: []}; continue; }
+    cur.nodes.push(n);
+  }
+  out.push(cur);
+  return out.filter(s => s.title || s.nodes.length);
+}
+
+function render() {
+  consumed.clear(); charts = []; editTables = {};
+  $("#loading").style.display = "none"; $("#grid").style.display = ""; $("#grid").classList.toggle("collapsed", collapsed);
+  const side = S.sidebar || [], main = S.main || [];
+
+  // ---- top row ----
+  const sport = W(side, "Selectbox", "Sport"), site = W(side, "Selectbox", "Site");
+  const src = W(main, "ButtonGroup", "Salaries"), slate = W(main, "Selectbox", "Slate"), contest = W(main, "Selectbox", "Contest");
+  const dkUp = find(main, n => n.w === "FileUploader" && /Salaries/i.test(n.label));
+  const projUp = find(main, n => n.w === "FileUploader" && /Projections/i.test(n.label));
+  const tg = find(main, n => n.t === "link" && /twogun/i.test(n.url));
+  const dkLink = find(main, n => n.t === "link" && /draftkings\.com\/lobby/i.test(n.url));
+  const refresh = find(main, n => n.w === "Button" && /^Refresh$/.test(clean(n.label)));
+  [sport, site, src, slate, contest, dkUp, projUp, tg, dkLink, refresh].forEach(n => n && consumed.add(n));
+  walk(side, n => { if (n.t === "heading" && n.level === 2) consumed.add(n); });
+  const selBox = (n, title, cls = "", fmt = o => o) => n ? `<div class="sel ${cls}"><small>${title}</small><select data-sel="${esc(n.id)}">${n.index == null ? `<option value="" selected>${esc(n.placeholder || "Choose…")}</option>` : ""}${n.options.map((o,i) => `<option value="${i}" ${i===n.index?"selected":""}>${esc(fmt(o))}</option>`).join("")}</select></div>` : "";
+  const upBox = (n, title) => n ? `<div class="sel"><small>${title}</small><label class="file" style="cursor:pointer" title="${esc(n.file || "")}">${n.file ? `${esc(n.file)} <a>change</a>` : `<span class="muted">Choose CSV…</span>`}<input type="file" hidden data-up="${esc(n.id)}" accept=".csv${/Salaries/.test(n.label)?"":""}"></label></div>` : "";
+  let top = selBox(sport, "Sport", "fixed") + selBox(site, "Format", "fixed", o => o === "DraftKings" ? "Classic" : o.replace("DraftKings ", ""));
+  if (src) top += `<div class="sel"><small>Salaries</small><div class="seg" style="padding:2px">${src.options.map((o,i) => `<button class="${src.index.includes(i)?"on":""}" data-bg="${esc(src.id)}" data-i="${i}" data-single="1">${esc(o.replace("DraftKings lobby","DK lobby"))}</button>`).join("")}</div></div>`;
+  top += selBox(slate, "Slate");
+  top += contest ? `<div class="sel wide"><small>Contest · type to search</small>${comboBox(contest)}</div>` : "";
+  if (dkUp) top += upBox(dkUp, "Salaries CSV");
+  top += upBox(projUp, "Projections cheatsheet CSV");
+  const pair = [tg && `<a class="btn sm" href="${esc(tg.url)}" target="_blank" rel="noopener" title="${esc(tg.help)}">${esc(clean(tg.label))} ↗</a>`,
+                dkLink && `<a class="btn sm" href="${esc(dkLink.url)}" target="_blank" rel="noopener" title="${esc(dkLink.help)}">${esc(clean(dkLink.label))} ↗</a>`,
+                refresh && `<button class="btn sm" data-click="${esc(refresh.id)}" data-label="Refresh" title="${esc(refresh.help)}">Refresh lobby</button>`].filter(Boolean);
+  if (pair.length) top += `<div class="btnpair">${pair.join("")}</div>`;
+  $("#top").innerHTML = top;
+
+  // ---- settings (the old sidebar) ----
+  let groups = [{title: "Build", nodes: []}];
+  for (const n of side) {
+    if (consumed.has(n)) continue;
+    if (n.t === "heading") { groups.push({title: clean(n.text), nodes: []}); continue; }
+    if (n.t === "block" && (n.kind === "expander" || n.kind === "status")) { groups.push({title: clean(n.label), nodes: n.children}); continue; }
+    groups[groups.length - 1].nodes.push(n);
+  }
+  $("#settings").innerHTML = `<div class="rail" data-collapse="0" title="Show settings"><button class="collapse">»</button><span>SETTINGS</span></div><h3>Settings <span style="display:flex;gap:8px;align-items:center">auto-set from the contest <button class="collapse" data-collapse="1" title="Hide settings">«</button></span></h3>` +
+    groups.filter(g => g.nodes.length).map(g => `<div class="grp"><h4>${esc(g.title)}</h4>${Rs(g.nodes)}</div>`).join("");
+
+  // ---- sections -> pages ----
+  const secs = sections(main);
+  const pages = {pool: [], rules: [], res: [], lb: [], live: [], ai: []};
+  let gen = null, resSecs = [], genLeft = [], seenGen = false;
+  for (const s of secs) {
+    const t = s.title;
+    if (!t || /Upload Files/i.test(t)) { pages.pool.push({title: "", nodes: s.nodes, notes: true}); continue; }
+    if (/Player Pool/i.test(t)) {
+      const k = s.nodes.findIndex(n => n.t === "md" && /Player combos/i.test(n.text));
+      if (k >= 0) { pages.pool.push({title: "Player pool", nodes: s.nodes.slice(0, k), pool: true}); pages.rules.unshift({title: "Player groups", nodes: s.nodes.slice(k + 1)}); }
+      else pages.pool.push({title: "Player pool", nodes: s.nodes, pool: true});
+      continue;
+    }
+    if (/Generate Lineups/i.test(t)) { seenGen = true; gen = find(s.nodes, n => n.w === "Button" && /Generate Lineups/i.test(n.label)); if (gen) consumed.add(gen); genLeft = s.nodes; continue; }
+    if (/Lineup Builder/i.test(t)) { pages.lb.push({title: "Lineup builder", nodes: s.nodes}); continue; }
+    if (/Live Contest/i.test(t)) { pages.live.push({title: "Live contest", nodes: s.nodes}); continue; }
+    if (/Lineup assistant/i.test(t)) { pages.ai.push({title: "Lineup assistant", nodes: s.nodes}); continue; }
+    if (seenGen || RESULT_HEADS.test(t)) { resSecs.push(s); continue; }
+    pages.rules.push({title: t.replace(/^\d+\.\s*/, ""), nodes: s.nodes});
+  }
+
+  // ---- no points at all (lobby salaries, no projections file) -> don't let a build run blind ----
+  const poolT = find(main, n => n.t === "table" && (n.key || "").startsWith("player_editor"));
+  let noPoints = false;
+  if (poolT) {
+    const pc = ["ppg_projection", "Projection", "AvgPoints"].map(c => poolT.cols.indexOf(c)).filter(i => i >= 0);
+    noPoints = poolT.rows.length > 0 && poolT.rows.every(r => pc.every(i => !r[i]));
+  }
+  const noPtsMsg = `No projections loaded, so every player has 0 points and a build would be random. Upload the ${sport && sport.options[sport.index] === "NBA" ? "TwoGunGPT NBA board" : "projections cheatsheet"} in the top bar first.`;
+
+  // ---- steps bar ----
+  $("#steps").innerHTML = PAGES.map(([id, num, name]) => `<button class="step ${step===id?"on":""}" data-step="${id}"><em>${num}</em>${name}</button>`).join("") +
+    (gen ? `<button class="btn primary gen" data-click="${esc(gen.id)}" data-label="Generate Lineups" ${gen.disabled || noPoints ? "disabled" : ""} title="${noPoints ? esc(noPtsMsg) : ""}">Generate lineups</button>`
+         : `<button class="btn primary gen" disabled title="Load salaries and projections first">Generate lineups</button>`);
+
+  // ---- page body ----
+  let h = "";
+  if (step === "pool") {
+    for (const p of pages.pool) {
+      if (p.notes) { const inner = Rs(p.nodes); if (inner.trim()) h += `<div class="stack" style="margin-bottom:16px">${inner}</div>`; }
+      else h += `<div class="card"><h3>${esc(p.title)} <span>lock · exclude · min / max exposure per player</span></h3><div class="body">${Rs(p.nodes)}</div></div>`;
+    }
+    if (!pages.pool.some(p => p.pool)) h += `<div class="card empty">Pick a slate (or upload salaries) and upload the projections cheatsheet to load the player pool.</div>`;
+  } else if (step === "rules") {
+    h = pages.rules.length ? `<div class="cards">${pages.rules.map(p => `<div class="card"><h3>${esc(p.title)}</h3><div class="body">${Rs(p.nodes)}</div></div>`).join("")}</div>`
+                           : `<div class="card empty">Rules appear once the player pool is loaded.</div>`;
+  } else if (step === "res") {
+    h = resultsPage(resSecs, genLeft, gen);
+  } else {
+    const ps = pages[step];
+    h = ps.length ? ps.map(p => `<div class="card"><h3>${esc(p.title)}</h3><div class="body">${Rs(p.nodes)}</div></div>`).join("")
+                  : `<div class="card empty">${step === "ai" ? "The assistant appears after you build lineups (and needs an API key in Settings)." : step === "lb" ? "The lineup builder appears once the player pool is loaded." : "Load a slate and the projections cheatsheet to use the live contest view."}</div>`;
+  }
+  if (noPoints && (step === "pool" || step === "res")) h = `<div class="note warning" style="margin-bottom:12px"><p><strong>No projections loaded.</strong> ${esc(noPtsMsg.replace(/^No projections loaded, so /, "Every player has 0 points, so ").replace("Every player has 0 points, so every player has 0 points", "Every player has 0 points"))}</p></div>` + h;
+  if (S.restored && !restoredShown) { restoredShown = true;
+    h = `<div class="note success" style="margin-bottom:12px"><p><strong>Picked up where you left off</strong> (saved ${esc(S.restored.saved)}). Built lineups aren't kept; press Generate to build again.${S.restored.skipped?.length ? ` Couldn't put back: ${esc([...new Set(S.restored.skipped)].join(", "))} (no longer on DraftKings).` : ""}</p></div>` + h; }
+  if (S.exceptions?.length) h = S.exceptions.map(e => `<div class="note error"><pre>${esc(e)}</pre></div>`).join("") + h;
+  $("#page").innerHTML = h;
+  for (const [id, spec] of charts) {
+    try { spec.background = "transparent"; spec.config = Object.assign({axis:{labelColor:"#8b98a8",titleColor:"#8b98a8",gridColor:"#26303d",domainColor:"#26303d"},view:{stroke:null},legend:{labelColor:"#8b98a8",titleColor:"#8b98a8"}}, spec.config || {});
+      spec.width = "container"; vegaEmbed("#" + id, spec, {actions:false, theme:"dark", renderer:"svg"}).catch(e => {}); } catch(e) {}
+  }
+}
+
+function resultsPage(resSecs, genLeft, gen) {
+  const pre = Rs(genLeft);
+  if (!resSecs.length) return (pre.trim() ? `<div class="stack" style="margin-bottom:16px">${pre}</div>` : "") +
+    `<div class="card empty">No lineups yet. Set things up, then press <b>Generate lineups</b>.</div>`;
+  const titles = resSecs.map(s => s.title);
+  if (!resTab || !titles.includes(resTab)) resTab = titles[0];
+  const first = resSecs[0];
+  // headline numbers + "why lineup 1" note live above the tabs
+  let kpis = "", why = "";
+  const mBlock = first.nodes.find(n => n.t === "block" && n.children?.some(c => c.t === "metric"));
+  if (mBlock) { consumed.add(mBlock); kpis = `<div class="kpis">${Rs(mBlock.children)}</div>`; }
+  const whyN = first.nodes.find(n => n.t === "alert" && /Why lineup 1|Lineups are listed in the order/i.test(n.text));
+  if (whyN) { consumed.add(whyN); why = `<div class="note">${md(whyN.text)}</div>`; }
+  let dl = null; walk(first.nodes, n => { if (!dl && n.w === "DownloadButton") dl = n; });
+  if (dl) consumed.add(dl);
+  const cur = resSecs.find(s => s.title === resTab);
+  return `<div class="stack">${pre.trim() ? `<div>${pre}</div>` : ""}${kpis}${why}
+    <div class="card"><div class="tabs">${titles.map(t => `<button class="tab ${t===resTab?"on":""}" data-rtab="${esc(t)}">${esc(t)}</button>`).join("")}<div class="spacer"></div>
+    ${dl ? `<a class="btn sm primary" style="margin:2px 0 6px" href="/api/media?url=${encodeURIComponent(dl.url)}" title="${esc(dl.help)}">${esc(clean(dl.label))} ↓</a>` : ""}</div>
+    <div class="body">${Rs(cur.nodes)}</div></div></div>`;
+}
+
+// ---------------- events ----------------
+document.addEventListener("click", e => {
+  if (e.target.closest("[data-projreset]")) { api({op:"proj", reset:true}); return; }
+  if (e.target.closest("[data-dict]")) { showDict = !showDict; render(); return; }
+  const c = e.target.closest("[data-collapse]");
+  if (c) { collapsed = c.dataset.collapse === "1"; try { localStorage.setItem("settingsCollapsed", collapsed ? "1" : "0"); } catch(err) {}
+    $("#grid").classList.toggle("collapsed", collapsed); return; }
+  const t = e.target.closest("[data-step],[data-rtab],[data-tabsel],[data-pick],[data-bg],[data-ms],[data-msdel],[data-tog],[data-click],[data-clear],[data-chatgo],[data-etrm],[data-etnew],[data-etdel]");
+  if (!t || t.disabled) return;
+  const d = t.dataset;
+  if (d.step) { step = d.step; history.replaceState(null, "", "#" + step); render(); window.scrollTo({top: 0}); return; }
+  if (d.rtab) { resTab = d.rtab; render(); return; }
+  if (d.tabsel) { tabSel[d.tabsel] = +d.i; render(); return; }
+  if (d.pick) return set(d.pick, +d.i);
+  if (d.bg) { const n = findId(d.bg); const i = +d.i;
+    if (d.single === "1") return set(d.bg, n.index.includes(i) ? (n.options.length <= 2 ? i : null) : i);
+    const s = new Set(n.index); s.has(i) ? s.delete(i) : s.add(i); return set(d.bg, [...s]); }
+  if (d.ms) { const n = findId(d.ms); const s = new Set(n.index); const i = +d.i; s.has(i) ? s.delete(i) : s.add(i); return set(d.ms, [...s]); }
+  if (d.msdel) { const n = findId(d.msdel); return set(d.msdel, n.index.filter(i => i !== +d.i)); }
+  if (d.tog) return set(d.tog, d.v !== "1");
+  if (d.click) return click(d.click, d.label || "");
+  if (d.clear) { e.preventDefault(); return api({op:"upload", id:d.clear, clear:true}); }
+  if (d.chatgo) { const inp = document.querySelector(`[data-chat="${CSS.escape(d.chatgo)}"]`); if (inp.value.trim()) api({op:"set", id:d.chatgo, value:inp.value, long:true, what:"Asking the assistant"}); return; }
+  if (d.etrm) { const n = editTables[d.etrm]; if (+d.r >= n.rows.length) { pendingCombo = null; render(); return; } const rows = etRows(n); rows.splice(+d.r, 1); return etSend(n, rows); }
+  if (d.etnew) { const n = editTables[d.etnew]; const rows = etRows(n); const cfg = n.config || {};
+    const blank = Object.fromEntries(n.cols.map(c => { const tc = cfg[c]?.type_config || {}; return [c, tc.type === "selectbox" ? (tc.options?.[0]?.value ?? tc.options?.[0] ?? "") : tc.type === "multiselect" ? [] : tc.type === "number" ? (tc.min_value ?? 0) : ""]; }));
+    if (n.key.startsWith("combo_editor")) { // a player group needs players first; keep it local until it has two
+      pendingCombo = blank; render(); return; }
+    rows.push(blank); return etSend(n, rows); }
+  if (d.etdel) { const n = editTables[d.etdel]; const rows = etRows(n); rows[+d.r][d.c] = rows[+d.r][d.c].filter((_, j) => j !== +d.j); return etSend(n, rows); }
+});
+let pendingCombo = null, restoredShown = false;
+document.addEventListener("change", e => {
+  const t = e.target, d = t.dataset;
+  if (d.sel !== undefined) return set(d.sel, t.value === "" ? null : +t.value);
+  if (d.num) return set(d.num, t.value === "" ? null : +t.value);
+  if (d.slide) return set(d.slide, +t.value);
+  if (d.txt) return set(d.txt, t.value);
+  if (d.msadd && t.value !== "") { const n = findId(d.msadd); return set(d.msadd, [...n.index, +t.value]); }
+  if (d.proj) return api({op:"proj", name:d.name, col:d.proj, value: t.value === "" ? null : +t.value});
+  if (d.pool) return api({op:"pool", name:d.name, field:d.pool, value: t.type === "checkbox" ? t.checked : (t.value === "" ? null : +t.value)});
+  if (d.et && pendingCombo && +d.r >= editTables[d.et].rows.length) { pendingCombo[d.c] = t.value === "" ? null : +t.value; return; }
+  if (d.et) { const n = editTables[d.et]; const rows = etRows(n); const tc = n.config?.[d.c]?.type_config || {};
+    rows[+d.r][d.c] = t.type === "checkbox" ? t.checked : (tc.type === "number" || t.type === "number") ? (t.value === "" ? null : +t.value) : t.value; return etSend(n, rows); }
+  if (d.etadd && t.value) { const n = editTables[d.etadd]; const rows = etRows(n);
+    if (+d.r >= rows.length && pendingCombo) { pendingCombo[d.c] = [...(pendingCombo[d.c] || []), t.value];
+      if (pendingCombo[d.c].length < 2) { render(); return; }
+      rows.push(pendingCombo); pendingCombo = null; return etSend(n, rows); }
+    rows[+d.r][d.c] = [...(rows[+d.r][d.c] || []), t.value]; return etSend(n, rows); }
+  if (d.up) { const f = t.files[0]; if (!f) return; const rd = new FileReader();
+    rd.onload = () => api({op:"upload", id:d.up, name:f.name, mime:f.type || "text/csv", b64: rd.result.split(",")[1]}); rd.readAsDataURL(f); }
+});
+document.addEventListener("input", e => { const d = e.target.dataset; if (d.slide) { const b = document.getElementById("sv-" + d.slide); if (b) b.textContent = e.target.value; } });
+document.addEventListener("keydown", e => { if (e.key === "Enter" && e.target.dataset.chat !== undefined) document.querySelector(`[data-chatgo="${CSS.escape(e.target.dataset.chat)}"]`)?.click(); });
+document.addEventListener("toggle", e => { const k = e.target.dataset?.det; if (k == null) return; if (e.target.open) { openDet.add(k); openDet.delete("!" + k); } else { openDet.delete(k); openDet.add("!" + k); } }, true);
+document.addEventListener("dragover", e => { if (e.target.closest(".drop,.sel")) e.preventDefault(); });
+document.addEventListener("drop", e => { const z = e.target.closest(".drop,.sel"); const inp = z?.querySelector("input[type=file]"); if (!inp) return; e.preventDefault();
+  const dt = new DataTransfer(); dt.items.add(e.dataTransfer.files[0]); inp.files = dt.files; inp.dispatchEvent(new Event("change", {bubbles:true})); });
+
+// ---------------- type-to-search picker ----------------
+function comboBox(n) {
+  const cur = n.index == null ? "" : n.options[n.index];
+  return `<div class="combo"><input class="cbin" data-cbin="${esc(n.id)}" value="${esc(cur)}" title="${esc(cur)}" placeholder="${esc(n.placeholder || "Type to search…")}" autocomplete="off" spellcheck="false" ${n.disabled ? "disabled" : ""}><div class="cblist"></div></div>`;
+}
+let cb = null;   // {id, input, list, matches, hl}
+function cbFill(q) {
+  const n = findId(cb.id); if (!n) return;
+  const words = q.toLowerCase().split(/\s+/).filter(Boolean);
+  cb.matches = n.options.map((o, i) => [o, i]).filter(([o]) => { const l = o.toLowerCase(); return words.every(w => l.includes(w)); });
+  cb.hl = Math.min(cb.hl, Math.max(cb.matches.length - 1, 0));
+  const mark = o => { let s = esc(o); for (const w of words) s = s.replace(new RegExp("(" + w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ")", "ig"), "<mark>$1</mark>"); return s; };
+  const shown = cb.matches.slice(0, 300);
+  cb.list.innerHTML = `<div class="cbcount">${cb.matches.length.toLocaleString()} of ${n.options.length.toLocaleString()}${words.length ? " match" : ""}</div>` +
+    shown.map(([o, i], k) => `<div class="cbi ${k === cb.hl ? "hl" : ""} ${i === n.index ? "cur" : ""}" data-cbpick="${i}">${mark(o)}</div>`).join("") +
+    (cb.matches.length > 300 ? `<div class="cbcount">Keep typing to narrow it down</div>` : "");
+  cb.list.querySelector(".hl")?.scrollIntoView({block: "nearest"});
+}
+function cbOpen(inp) {
+  cb = {id: inp.dataset.cbin, input: inp, list: inp.parentElement.querySelector(".cblist"), matches: [], hl: 0};
+  inp.select(); cb.list.classList.add("on"); cbFill("");
+}
+function cbClose(restore = true) {
+  if (!cb) return; cb.list.classList.remove("on");
+  if (restore) { const n = findId(cb.id); cb.input.value = n && n.index != null ? n.options[n.index] : ""; }
+  cb = null;
+}
+function cbPick(i) { const id = cb.id; cb.input.value = findId(id).options[i]; cbClose(false); set(id, i); }
+document.addEventListener("focusin", e => { if (e.target.dataset?.cbin) cbOpen(e.target); });
+document.addEventListener("focusout", e => { if (e.target.dataset?.cbin && cb) setTimeout(() => { if (cb && document.activeElement !== cb.input) cbClose(); }, 150); });
+document.addEventListener("input", e => { if (e.target.dataset?.cbin && cb) { cb.hl = 0; cbFill(e.target.value); } });
+document.addEventListener("mousedown", e => { const p = e.target.closest("[data-cbpick]"); if (p && cb) { e.preventDefault(); cbPick(+p.dataset.cbpick); } });
+document.addEventListener("keydown", e => {
+  if (!cb || e.target !== cb.input) return;
+  if (e.key === "ArrowDown") { e.preventDefault(); cb.hl = Math.min(cb.hl + 1, cb.matches.length - 1); cbFill(cb.input.value === findId(cb.id).options[findId(cb.id).index] ? "" : cb.input.value); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); cb.hl = Math.max(cb.hl - 1, 0); cbFill(cb.input.value === findId(cb.id).options[findId(cb.id).index] ? "" : cb.input.value); }
+  else if (e.key === "Enter") { e.preventDefault(); if (cb.matches[cb.hl]) cbPick(cb.matches[cb.hl][1]); }
+  else if (e.key === "Escape") { cb.input.blur(); }
+});
+function findId(id) { return find(S.main, n => n.id === id) || find(S.sidebar, n => n.id === id); }
+load();
+</script>
+</body>
+</html>
