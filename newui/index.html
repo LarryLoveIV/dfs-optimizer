@@ -591,6 +591,7 @@ function render() {
   }
   if (noPoints && (step === "pool" || step === "res")) h = `<div class="note warning" style="margin-bottom:12px"><p><strong>No projections loaded.</strong> ${esc(noPtsMsg.replace(/^No projections loaded, so /, "Every player has 0 points, so ").replace("Every player has 0 points, so every player has 0 points", "Every player has 0 points"))}</p></div>` + h;
   if (S.restored && !restoredShown) { restoredShown = true;
+    S.restored.skipped = (S.restored.skipped || []).filter(l => { const w = find(main.concat(side), n => n.t === "widget" && n.label === l); return !(w && (w.index != null && (!Array.isArray(w.index) || w.index.length))); });
     h = `<div class="note success" style="margin-bottom:12px"><p><strong>Picked up where you left off</strong> (saved ${esc(S.restored.saved)}). Built lineups aren't kept; press Generate to build again.${S.restored.skipped?.length ? ` Couldn't put back: ${esc([...new Set(S.restored.skipped)].join(", "))} (no longer on DraftKings).` : ""}</p></div>` + h; }
   if (S.exceptions?.length) h = S.exceptions.map(e => `<div class="note error"><pre>${esc(e)}</pre></div>`).join("") + h;
   $("#page").innerHTML = h;

@@ -148,8 +148,28 @@ class Session:
 
     def start(self):
         os.chdir(APP_DIR)
+        self.app_mtime = os.path.getmtime(os.path.join(APP_DIR, "app.py"))
         self.at = AppTest.from_file(os.path.join(APP_DIR, "app.py"), default_timeout=7200)
         self.at.run()
+
+    def refresh_app(self):
+        """app.py changed on disk: load the new version, put the setup back and keep
+        the built lineups, so changes to the app show up without losing work."""
+        try:
+            m = os.path.getmtime(os.path.join(APP_DIR, "app.py"))
+        except OSError:
+            return
+        if m == self.app_mtime:
+            return
+        ss = self.at.session_state
+        kept = ss["results"] if "results" in ss else None
+        self.save()
+        self.files, self.cheat, self.log = {}, None, []
+        self.start()
+        self.restore()
+        if kept is not None:
+            self.at.session_state["results"] = kept
+            self.run()
 
     # ---------- running ----------
     def run(self, overrides=None):
@@ -329,7 +349,11 @@ class Session:
 
     def _remember(self, entry):
         ident = json.dumps(entry["sel"], sort_keys=True)
-        self.log = [e for e in self.log if json.dumps(e["sel"], sort_keys=True) != ident] + [entry]
+        # One slate/contest pick is enough: keys differ per slate and sport, and old
+        # picks can't be put back once you've moved on.
+        same = (lambda e: e["sel"]["label"] == entry["sel"]["label"]) if entry["sel"]["label"] in ("Slate", "Contest") else (lambda e: False)
+        self.log = [e for e in self.log
+                    if json.dumps(e["sel"], sort_keys=True) != ident and not same(e)] + [entry]
 
     def save(self):
         if self.replaying:
@@ -414,7 +438,10 @@ class Session:
                 self._write_cheat()
         finally:
             self.replaying = False
-        self.restored = {"saved": data.get("saved"), "skipped": skipped}
+        # Only mention what is still missing: a later step for the same control may
+        # have put it back (e.g. a contest from another sport, then today's contest).
+        done = {e["sel"]["label"] for e in self.log}
+        self.restored = {"saved": data.get("saved"), "skipped": [k for k in skipped if k not in done]}
 
     # ---------- projection edits ----------
     def _read_cheat(self, uid, name, data):
@@ -659,6 +686,7 @@ def state(request):
         return JSONResponse({"busy": s.busy, "now": time.time()})
     with s.lock:
         try:
+            s.refresh_app()
             return JSONResponse(s.state())
         except Exception as exc:
             return _err(exc)
@@ -688,6 +716,7 @@ async def act(request: Request):
 
     def do():
         with s.lock:
+            s.refresh_app()
             s.act(a)
             try:
                 s.save()
