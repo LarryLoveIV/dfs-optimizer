@@ -214,6 +214,29 @@ def secret(name):
 
 
 @st.fragment
+def one_row_per_player(found):
+    """The checks list with each player's issue shown once and the lineups he's in
+    listed beside it; lineup-wide issues (salary, duplicates) stay one row each."""
+    def lineup_list(ids):
+        ids = list(dict.fromkeys(ids))
+        if "all" in ids:
+            return "all"
+        ids = sorted(ids, key=lambda x: (not str(x).isdigit(), int(x) if str(x).isdigit() else 0, str(x)))
+        return ", ".join(map(str, ids))
+    per_player = found[found["Player"].astype(str).str.len() > 0]
+    lineup_wide = found[found["Player"].astype(str).str.len() == 0]
+    grouped = (per_player.groupby(["Player", "Issue", "Severity"], sort=False)["Lineup"]
+               .agg(lambda s: (len(set(s) - {"all"}), lineup_list(s))).reset_index())
+    rows = [{"Player": r.Player, "Issue": r.Issue, "Severity": r.Severity,
+             "In lineups": r.Lineup[0] or None, "Lineups": r.Lineup[1]}
+            for r in grouped.itertuples()]
+    rows += [{"Player": "", "Issue": r.Issue, "Severity": r.Severity, "In lineups": 1,
+              "Lineups": str(r.Lineup)} for r in lineup_wide.itertuples()]
+    out = pd.DataFrame(rows, columns=["Player", "Issue", "Severity", "In lineups", "Lineups"])
+    out["In lineups"] = out["In lineups"].astype("Int64")
+    return out.sort_values("Severity", key=lambda s: s.ne("Fix"), kind="stable")
+
+
 def lineup_assistant(results, merged_df, csv_text, is_showdown, target, excluded,
                      roster_size, budget, draft_group_id):
     """Checks every lineup, then answers questions about the build. A fragment,
@@ -246,10 +269,11 @@ def lineup_assistant(results, merged_df, csv_text, is_showdown, target, excluded
     if found.empty:
         st.success("No problems found in these lineups.", icon=":material/check_circle:")
     else:
-        fixes = int(found["Severity"].eq("Fix").sum())
+        shown = one_row_per_player(found)
+        fixes = int(shown["Severity"].eq("Fix").sum())
         (st.error if fixes else st.warning)(
-            f"{fixes} to fix, {len(found) - fixes} to watch.", icon=":material/warning:")
-        st.dataframe(found, hide_index=True, width="stretch")
+            f"{fixes} to fix, {len(shown) - fixes} to watch.", icon=":material/warning:")
+        st.dataframe(shown, hide_index=True, width="stretch")
 
     provider = st.session_state.get("assist_provider", "Gemini")
     model = st.session_state.get("assist_model") or agent.PROVIDERS[provider]["model"]
