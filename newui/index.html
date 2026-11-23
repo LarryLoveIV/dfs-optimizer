@@ -131,6 +131,7 @@ h4.sub{margin:14px 0 6px;font-size:13px}
 .frow.btns{align-items:center}
 .scroll{overflow:auto;max-height:620px;border:1px solid var(--line);border-radius:10px;margin:6px 0}
 table{border-collapse:collapse;width:100%;font-size:12.5px}
+th.sort{cursor:pointer;user-select:none}th.sort:hover{color:var(--text)}th.sort.on{color:var(--accent)}
 th{position:sticky;top:0;background:var(--panel);color:var(--muted);font-weight:500;text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap;z-index:1}
 td{padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
 tr:hover td{background:var(--panel2)}
@@ -202,6 +203,8 @@ hr{border:0;border-top:1px solid var(--line);margin:12px 0}
 let S = null;                 // latest app state from the server
 let step = (location.hash.slice(1) || "pool"), resTab = null, openDet = new Set(), tabSel = {};
 const consumed = new Set();
+let lineSort = null; try { lineSort = JSON.parse(localStorage.getItem("lineSort") || "null"); } catch(e) {}
+let poolSort = null; try { poolSort = JSON.parse(localStorage.getItem("poolSort") || "null"); } catch(e) {}
 let collapsed = false; try { collapsed = localStorage.getItem("settingsCollapsed") === "1"; } catch(e) {}
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -352,6 +355,8 @@ function fmtVal(v, cfg) {
   if (v == null || v === "") return "";
   const f = cfg?.type_config?.format;
   if (typeof v === "number") {
+    const ef = f && f.match(/^%\.(\d+)e$/);
+    if (ef) return Number(v).toExponential(+ef[1]).replace(/e([+-])(\d)$/, "e$1$2");
     if (f && f.includes("%")) {
       const m = f.match(/^(.*?)%([+]?)(?:\.(\d+))?([df])(.*)$/);
       if (m) { const dec = m[4] === "d" ? 0 : +(m[3] ?? 2); let s = Number(v).toLocaleString(undefined, {minimumFractionDigits:dec, maximumFractionDigits:dec});
@@ -388,8 +393,21 @@ function lineupTable(n, vis, cfg) {
   const slots = vis.filter(([c]) => POS[c.replace(/\d+$/,"")] || POS[c]);
   const slotIdx = new Set(slots.map(([,i]) => i));
   const first = new Set(slots.map(([,i]) => n.rows[0]?.[i]));
-  const head = vis.map(([c]) => `<th title="${esc(cfg[c]?.help || "")}">${esc(clean(cfg[c]?.label || c))}</th>`).join("");
-  const body = n.rows.map((r, k) => `<tr class="${k?"":"first"}">` + vis.map(([c,i]) => {
+  const iSal = vis.findIndex(([c]) => c === "Salary");
+  const sortable = new Set(iSal >= 0 ? vis.slice(iSal).map(([c]) => c) : []);
+  const head = vis.map(([c]) => { const t = esc(clean(cfg[c]?.label || c)), h = cfg[c]?.help || "";
+    if (!sortable.has(c)) return `<th title="${esc(h)}">${t}</th>`;
+    const on = lineSort && lineSort.col === c;
+    return `<th class="sort ${on ? "on" : ""}" data-lsort="${esc(c)}" title="${esc((h ? h + " — " : "") + "Click to sort")}">${t}${on ? (lineSort.dir > 0 ? " ▲" : " ▼") : ""}</th>`; }).join("");
+  let order = n.rows.map((r, k) => [r, k]);
+  const sc = lineSort && sortable.has(lineSort.col) ? n.cols.indexOf(lineSort.col) : -1;
+  if (sc >= 0) {
+    const key = v => (v === "" || v == null) ? null : (typeof v === "number" ? v : (isNaN(+v) ? String(v).toLowerCase() : +v));
+    order.sort((a, b) => { const x = key(a[0][sc]), y = key(b[0][sc]);
+      if (x === y) return a[1] - b[1]; if (x == null) return 1; if (y == null) return -1;
+      return (x < y ? -1 : 1) * lineSort.dir; });
+  }
+  const body = order.map(([r, k]) => `<tr class="${k?"":"first"}">` + vis.map(([c,i]) => {
     const v = r[i];
     if (c === "#") return `<td><span class="rank num">${esc(v)}</span></td>`;
     if (slotIdx.has(i)) { const base = POS[c] || POS[c.replace(/\d+$/,"")]; return `<td><span class="p ${k ? (first.has(v) ? "same" : "diff") : ""}" style="--c:var(${base})">${esc(v)}</span></td>`; }
@@ -408,8 +426,18 @@ function poolTable(n, vis, cfg) {
   const iL = ci("Lock"), iE = ci("Exclude"), iMin = ci("Min Exp %"), iMax = ci("Max Exp %"), iN = ci("Name"), iQ = ci("injury_status");
   const front = ["Lock","Exclude"], back = ["Min Exp %","Max Exp %"];
   const mid = vis.filter(([c]) => !front.includes(c) && !back.includes(c) && c !== "injury_status" && c !== "ppg_projection");
-  const head = `<th>Lock</th><th>Excl.</th>` + mid.map(([c]) => `<th title="${esc(cfg[c]?.help || "")}">${esc(clean(cfg[c]?.label || c))}</th>`).join("") + `<th title="${esc(cfg["Min Exp %"]?.help||"")}">Min %</th><th title="${esc(cfg["Max Exp %"]?.help||"")}">Max %</th>`;
-  const body = n.rows.map(r => {
+  const sh = (c, text, help) => { const on = poolSort && poolSort.col === c;
+    return `<th class="sort ${on ? "on" : ""}" data-psort="${esc(c)}" title="${esc((help ? help + " — " : "") + "Click to sort")}">${esc(text)}${on ? (poolSort.dir > 0 ? " ▲" : " ▼") : ""}</th>`; };
+  const head = sh("Lock","Lock") + sh("Exclude","Excl.") + mid.map(([c]) => sh(c, clean(cfg[c]?.label || c), cfg[c]?.help)).join("") + sh("Min Exp %","Min %",cfg["Min Exp %"]?.help) + sh("Max Exp %","Max %",cfg["Max Exp %"]?.help);
+  let rows = n.rows;
+  const si = poolSort ? ci(poolSort.col) : -1;
+  if (si >= 0) {
+    const key = v => v === true ? 1 : v === false ? 0 : (v === "" || v == null) ? null : (typeof v === "number" ? v : (isNaN(+v) ? String(v).toLowerCase() : +v));
+    rows = n.rows.map((r, k) => [r, k]).sort((a, b) => { const x = key(a[0][si]), y = key(b[0][si]);
+      if (x === y) return a[1] - b[1]; if (x == null) return 1; if (y == null) return -1;
+      return (x < y ? -1 : 1) * poolSort.dir; }).map(p => p[0]);
+  }
+  const body = rows.map(r => {
     const name = r[iN];
     return `<tr class="${r[iL]?"locked":""} ${r[iE]?"excl":""}"><td><input type="checkbox" data-pool="lock" data-name="${esc(name)}" ${r[iL]?"checked":""}></td><td><input type="checkbox" data-pool="exclude" data-name="${esc(name)}" ${r[iE]?"checked":""}></td>` +
       mid.map(([c,i]) => { const v = r[i];
@@ -467,6 +495,7 @@ function colDef(c) {
     "vs #1": "Rank score as a share of lineup 1's. 90% means this lineup's rank score is 90% of the top lineup's.",
     "Keeps %": "How much of a top finish you'd keep after duplicates: 1 ÷ (1 + expected duplicates). 100% means nobody else is expected to have this exact lineup.",
     "Exp. duplicates": "How many other entries in a field this size are expected to have this exact lineup, from projected ownership. 0.02 means about a 2% chance of one duplicate.",
+    "Product own": "All the players' projected ownership multiplied together (as fractions): the chance one random field lineup is exactly this one. Tiny numbers, shown in scientific form: 2.5e-10 means 0.00000000025. Smaller = more unique; it drives Exp. duplicates.",
     "Total own %": "The players' projected ownership added together. Lower means a more contrarian lineup; higher means more chalk.",
     "Sim avg": "The lineup's average score across all the simulated slates.",
     "Sim 99th": "The lineup's ceiling: the score it reaches or beats in only 1% of simulated slates.",
@@ -626,6 +655,20 @@ function resultsPage(resSecs, genLeft, gen) {
 // ---------------- events ----------------
 document.addEventListener("click", e => {
   if (e.target.closest("[data-projreset]")) { api({op:"proj", reset:true}); return; }
+  const ls = e.target.closest("[data-lsort]");
+  if (ls) { const c = ls.dataset.lsort;
+    if (!lineSort || lineSort.col !== c) lineSort = {col: c, dir: -1};
+    else if (lineSort.dir === -1) lineSort.dir = 1;
+    else lineSort = null;
+    try { localStorage.setItem("lineSort", JSON.stringify(lineSort)); } catch(err) {}
+    render(); return; }
+  const ps = e.target.closest("[data-psort]");
+  if (ps) { const c = ps.dataset.psort;
+    if (!poolSort || poolSort.col !== c) poolSort = {col: c, dir: ["Name","Position","Team","Opp","Game"].includes(c) ? 1 : -1};
+    else if (poolSort.dir === (["Name","Position","Team","Opp","Game"].includes(c) ? 1 : -1)) poolSort.dir *= -1;
+    else poolSort = null;
+    try { localStorage.setItem("poolSort", JSON.stringify(poolSort)); } catch(err) {}
+    render(); return; }
   if (e.target.closest("[data-dict]")) { showDict = !showDict; render(); return; }
   const c = e.target.closest("[data-collapse]");
   if (c) { collapsed = c.dataset.collapse === "1"; try { localStorage.setItem("settingsCollapsed", collapsed ? "1" : "0"); } catch(err) {}

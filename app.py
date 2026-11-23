@@ -1283,7 +1283,7 @@ def wide_lineups(long_df, sim_df, note):
         wide["vs #1"] = (wide["Rank score"] / score.iloc[0] * 100).round(0) if score.iloc[0] else None
         wide[rate_col] = wide["#"].map(s[rate_col])
         wide["Keeps %"] = wide["#"].map(keeps)
-        for c in ("Exp. duplicates", "Total own %", "Sim avg", "Sim 99th"):
+        for c in ("Exp. duplicates", "Total own %", "Product own", "Sim avg", "Sim 99th"):
             if c in s.columns:
                 wide[c] = wide["#"].map(s[c])
         top, runs = note.get("top", 0), note.get("runs", 0)
@@ -3460,6 +3460,12 @@ if dk_content is not None:
                 })
                 if field_on:
                     sim_df["Total own %"] = [round(sum(lineup_own[c]), 1) for c in chosen]
+                    # All the players' ownership multiplied together (as fractions, same
+                    # 0.01%-100% clip the duplicate model uses): the chance a random
+                    # field lineup is exactly this one.
+                    sim_df["Product own"] = [float(np.prod(np.clip(np.asarray(lineup_own[c], dtype=float),
+                                                                   0.01, 100) / 100))
+                                             for c in chosen]
                     sim_df["Exp. duplicates"] = dupes[chosen].round(2)
                     sim_df["Keeps %"] = (np.asarray(share)[chosen] * 100).round(0)
                 # The number the lineups are ordered by: top-slice rate x the share of a
@@ -3656,6 +3662,11 @@ if dk_content is not None:
                                  format="%.0f%%",
                                  help="Share of a top finish you keep: 1 ÷ (1 + expected "
                                       "duplicates in the field)."),
+                             "Product own": st.column_config.NumberColumn(
+                                 format="%.2e",
+                                 help="All the players' projected ownership multiplied "
+                                      "together: the chance one field lineup is exactly "
+                                      "this one. Smaller = more unique."),
                              "Opt. pts": st.column_config.NumberColumn(
                                  format="%.1f", help="The total the optimizer maximized "
                                                      "(the Optimize on number)."),
