@@ -107,6 +107,7 @@ input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px;cursor:po
 .steps button.step.on{color:var(--text);border-color:var(--accent)}
 .steps button.step.on em{background:var(--accent);color:#06210f}
 .steps .gen{margin-left:6px;padding:9px 18px}
+.steps .gen.dl{text-decoration:none;white-space:nowrap;background:transparent;color:var(--accent);border:1px solid var(--accent);padding:8px 14px}.steps .gen.dl:hover{background:rgba(61,220,151,.12)}.steps .gen.dl:disabled{color:var(--muted);border-color:var(--line);opacity:.6;cursor:not-allowed;background:transparent}
 .stack>*+*{margin-top:16px}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:16px;align-items:start}
 .kpis{display:flex;gap:12px;flex-wrap:wrap}
@@ -519,6 +520,14 @@ function sections(main) {
   for (const n of main) {
     if (n.t === "heading" && n.level === 1) continue;
     if (n.t === "heading" && n.level <= 3) { out.push(cur); cur = {title: clean(n.text), nodes: []}; continue; }
+    // A row of columns that each open with their own heading (Team Exposure | FLEX Breakdown)
+    // becomes one section per column instead of hiding inside the section above it.
+    const colHead = c => c.t === "block" && c.children?.[0]?.t === "heading" && c.children[0].level <= 3;
+    if (n.t === "block" && n.children?.length > 1 && n.children.every(colHead)
+        && n.children.some(c => /Team Exposure/i.test(c.children[0].text))) {
+      for (const c of n.children) { out.push(cur); cur = {title: clean(c.children[0].text), nodes: c.children.slice(1)}; }
+      continue;
+    }
     cur.nodes.push(n);
   }
   out.push(cur);
@@ -595,10 +604,19 @@ function render() {
   }
   const noPtsMsg = `No projections loaded, so every player has 0 points and a build would be random. Upload the ${sport && sport.options[sport.index] === "NBA" ? "TwoGunGPT NBA board" : "projections cheatsheet"} in the top bar first.`;
 
+  // ---- DK upload file: lives next to Generate, lit only when there are lineups to download ----
+  let dl = null;
+  for (const sec of resSecs) walk(sec.nodes, n => { if (!dl && n.w === "DownloadButton" && /DK upload/i.test(n.label || "")) dl = n; });
+  if (dl) consumed.add(dl);
+  const dlReady = dl && S.has_results && !S.busy;
+  const dlBtn = dlReady
+    ? `<a class="btn gen dl" href="/api/media?url=${encodeURIComponent(dl.url)}" title="Download the DK upload CSV — ${esc(dl.help || "")}">Download CSV ↓</a>`
+    : `<button class="btn gen dl" disabled title="${S.busy ? "Building lineups…" : "Generate lineups first — then this downloads them for DraftKings"}">Download CSV ↓</button>`;
+
   // ---- steps bar ----
   $("#steps").innerHTML = PAGES.map(([id, num, name]) => `<button class="step ${step===id?"on":""}" data-step="${id}"><em>${num}</em>${name}</button>`).join("") +
     (gen ? `<button class="btn primary gen" data-click="${esc(gen.id)}" data-label="Generate Lineups" ${gen.disabled || noPoints ? "disabled" : ""} title="${noPoints ? esc(noPtsMsg) : ""}">Generate lineups</button>`
-         : `<button class="btn primary gen" disabled title="Load salaries and projections first">Generate lineups</button>`);
+         : `<button class="btn primary gen" disabled title="Load salaries and projections first">Generate lineups</button>`) + dlBtn;
 
   // ---- page body ----
   let h = "";
@@ -643,12 +661,9 @@ function resultsPage(resSecs, genLeft, gen) {
   if (mBlock) { consumed.add(mBlock); kpis = `<div class="kpis">${Rs(mBlock.children)}</div>`; }
   const whyN = first.nodes.find(n => n.t === "alert" && /Why lineup 1|Lineups are listed in the order/i.test(n.text));
   if (whyN) { consumed.add(whyN); why = `<div class="note">${md(whyN.text)}</div>`; }
-  let dl = null; walk(first.nodes, n => { if (!dl && n.w === "DownloadButton") dl = n; });
-  if (dl) consumed.add(dl);
   const cur = resSecs.find(s => s.title === resTab);
   return `<div class="stack">${pre.trim() ? `<div>${pre}</div>` : ""}${kpis}${why}
-    <div class="card"><div class="tabs">${titles.map(t => `<button class="tab ${t===resTab?"on":""}" data-rtab="${esc(t)}">${esc(t)}</button>`).join("")}<div class="spacer"></div>
-    ${dl ? `<a class="btn sm primary" style="margin:2px 0 6px" href="/api/media?url=${encodeURIComponent(dl.url)}" title="${esc(dl.help)}">${esc(clean(dl.label))} ↓</a>` : ""}</div>
+    <div class="card"><div class="tabs">${titles.map(t => `<button class="tab ${t===resTab?"on":""}" data-rtab="${esc(t)}">${esc(t)}</button>`).join("")}</div>
     <div class="body">${Rs(cur.nodes)}</div></div></div>`;
 }
 
